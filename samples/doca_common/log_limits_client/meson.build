@@ -22,10 +22,38 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-sample_srcs = files([
-	SAMPLE_NAME + '_sample.c',
-])
+project('DOCA_SAMPLE', 'C', 'CPP',
+	version: run_command(find_program('cat'),
+		files('../../../VERSION'), check: true).stdout().strip(),
+	license: 'BSD-3',
+	default_options: ['buildtype=debug'],
+	meson_version: '>= 0.61.2'
+)
 
-sample_main_srcs = files([
+SAMPLE_NAME = 'log_limits_client'
+
+add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language: ['c'])
+
+# Make sure DOCA_LOG_TRC is available
+sample_c_args = ['-D DOCA_LOGGING_ALLOW_TRACE']
+
+sample_dependencies = []
+sample_dependencies += dependency('doca-common')
+sample_dependencies += dependency('doca-argp')
+
+sample_srcs = [
+	SAMPLE_NAME + '_sample.c',
 	SAMPLE_NAME + '_main.c',
-])
+	# Common code for the log_limits_client and server samples
+	'../log_common.c',
+]
+
+sample_inc_dirs = []
+sample_inc_dirs += include_directories('..')
+sample_inc_dirs += include_directories('../..')
+
+executable('doca_' + SAMPLE_NAME, sample_srcs,
+	c_args: sample_c_args,
+	dependencies : sample_dependencies,
+	include_directories: sample_inc_dirs,
+	install: false)
