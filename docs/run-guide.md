@@ -53,6 +53,22 @@ HOST_SSH='ssh 192.168.0.100'
 /opt/mellanox/doca/tools/doca_caps --list-rep-devs
 ```
 
+### 1.3 Host BMC/IPMI
+
+Host BMC/IPMI 访问方式与 DPU 类型无关，100GbE/200GbE 环境统一使用：
+
+```bash
+BMC_HOST=192.168.1.10
+BMC_USER=toutiao
+BMC_PASS='toutiao!@#'
+```
+
+检查 Host 电源状态：
+
+```bash
+ipmitool -I lanplus -H "$BMC_HOST" -U "$BMC_USER" -P "$BMC_PASS" power status
+```
+
 ## 2. applications/dma_copy
 
 ### 2.1 概述
@@ -230,9 +246,6 @@ $HOST_SSH "sed -r -i -e 's/eth0/enp63s0f0np0/' /etc/network/interfaces"
 ```bash
 DPU_DEV=0000:03:00.0
 VNET_MAC=52:54:00:12:34:56
-BMC_HOST=192.168.1.10
-BMC_USER=toutiao
-BMC_PASS='toutiao!@#'
 ```
 
 DPU 端先启动并保持运行：
@@ -358,7 +371,169 @@ auxiliary/mlx5_core.sf.4/6029312: type eth netdev enp3s0f0s1002 flavour virtual
 | `lspci` 看不到 `1af4:1041` endpoint | 确认 DPU 进程在 Host power cycle 前已启动并保持运行 |
 | DPU 日志没有 Host config read/write TLP | 确认 Host 确实从 BMC 重启，且不是只做了在线 PCI rescan |
 
-## 4. 后续章节模板
+## 4. applications/vblk_pci_dev
+
+### 4.1 概述
+
+`applications/vblk_pci_dev` 在 DPU 侧通过 DOCA DevEmu/TLP 创建 VirtIO Block PCI 设备，由 Host 在启动阶段枚举为
+virtio-blk 块设备。
+
+关键规则：
+
+- DPU 端必须先启动 `vblk_pci_dev` 并保持运行。
+- 基础测试使用 static mode，即 `-H 0`；不要把 Host 侧在线 `echo 1 > /sys/bus/pci/rescan` 作为主要测试流程。
+- DPU 进程启动后，通过 BMC/IPMI 对 Host 执行 power cycle；Host 在启动 PCI 扫描阶段枚举虚拟 PCI bridge 和
+  virtio-blk endpoint。
+- `vblk_pci_dev` 与 `vnet_pci_dev` 会竞争同类 DevEmu/TLP 资源；启动前确认没有其他 vnet/vblk emulation 进程占用资源。
+- 当前源码读写后端仍是占位实现，适合验证 PCI 枚举、virtio-pci 绑定、请求收发和容量通知；不要按真实磁盘做写后读
+  一致性校验。
+
+### 4.2 参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `-d, --emulation-manager` | DPU 侧 emulation manager mlx5 ibdev 名称；当前 100GbE/200GbE 环境为 `mlx5_bond_0` |
+| `-n, --num-ep` | 创建的 endpoint 数量；单盘测试使用 `1` |
+| `-H, --hotplug-mode` | hotplug 模式开关；启动期枚举测试使用 `0`，即 static mode |
+| `-q, --num-queues` | 每个 endpoint 的 virtio queue 数量；基础测试使用 `1` |
+| `--io-ctx-mask` | IO context CPU mask；基础测试使用 `0x1`，即 core 0 |
+| `--tlp-core-idx` | TLP 线程 CPU core；不能包含在 `--io-ctx-mask` 中，基础测试使用 `15` |
+| `--offload-engine-core-idx` | offload engine CPU core；必须包含在 `--io-ctx-mask` 中，基础测试使用 `0` |
+| `--provider` | 数据路径 provider，`DPA` 或 `DPU`；基础测试优先使用默认/显式 `DPA` |
+| `-l, --log-level` | 应用日志级别；调测建议 `60` |
+| `--sdk-log-level` | DOCA SDK 日志级别；调测建议 `40` |
+
+### 4.3 运行步骤
+
+变量约定：
+
+```bash
+DPU_IBDEV=mlx5_bond_0
+```
+
+启动前确认没有残留的 vnet/vblk emulation 进程占用 DevEmu/TLP 资源；如有，先停止残留进程。
+
+DPU 端启动并保持运行：
+
+```bash
+cd /root/ByteDance/doca-samples
+./applications/build/vblk_pci_dev/doca_vblk_pci_dev \
+  -d "$DPU_IBDEV" \
+  -n 1 \
+  -H 0 \
+  -q 1 \
+  --io-ctx-mask 0x1 \
+  --tlp-core-idx 15 \
+  --offload-engine-core-idx 0 \
+  --provider DPA \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+等待 DPU 日志出现：
+
+```text
+VBlk device initialized successfully (1 EPs)
+All is ready (1 EPs, 1 queues/EP), running progress loop
+```
+
+然后通过 BMC 重启 Host：
+
+```bash
+ipmitool -I lanplus -H "$BMC_HOST" -U "$BMC_USER" -P "$BMC_PASS" power cycle
+```
+
+DPU 日志应看到 Host reset 和 PCI 枚举过程，例如：
+
+```text
+PERST# is asserted (enters reset)
+PERST# is deasserted (released from reset)
+Device BDF set: 46:00.0 (bridge)
+Device BDF set: 47:00.0 (bridge)
+Device BDF set: 48:00.0 (endpoint)
+```
+
+等待 Host 启动完成后继续验证。
+
+### 4.4 校验
+
+Host 侧检查 PCI 设备和驱动：
+
+```bash
+$HOST_SSH "lspci -Dnn | grep -i '1af4\|virtio'"
+$HOST_SSH "lspci -Dnnk -s 0000:48:00.0"
+```
+
+100GbE 本地调测的期望输出包含：
+
+```text
+0000:46:00.0 PCI bridge [0604]: Red Hat, Inc. Device [1af4:10f1]
+0000:47:00.0 PCI bridge [0604]: Red Hat, Inc. Device [1af4:10f1]
+0000:48:00.0 Non-Volatile memory controller [0108]: Red Hat, Inc. Virtio 1.0 block device [1af4:1042]
+Kernel driver in use: virtio-pci
+```
+
+Host 侧检查块设备：
+
+```bash
+$HOST_SSH "lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL"
+$HOST_SSH "udevadm info --query=all --name=/dev/vda | egrep 'ID_SERIAL|ID_PATH|DEVPATH' || true"
+$HOST_SSH "blockdev --getsize64 /dev/vda"
+```
+
+期望状态：
+
+- Host 新增 `/dev/vda`。
+- `SERIAL` 或 `ID_SERIAL` 为 `vblk_bdev0`。
+- 默认容量为 `1073741824` 字节，即 1GiB。
+- `0000:48:00.0` 使用 `virtio-pci` 驱动。
+
+做最小 I/O smoke test：
+
+```bash
+$HOST_SSH "dd if=/dev/vda of=/dev/null bs=4K count=16 iflag=direct status=none && echo read_ok"
+$HOST_SSH "dd if=/dev/zero of=/dev/vda bs=4K count=16 oflag=direct status=none && sync && echo write_ok"
+```
+
+`read_ok` 和 `write_ok` 表示 virtio-blk 请求能成功完成。由于当前读写后端没有接真实 bdev，不要使用写后读内容一致性作为
+通过条件。
+
+### 4.5 运行时容量测试
+
+DPU 侧 `vblk_pci_dev` stdin 支持 `cap <GB>`。例如设置 2GiB：
+
+```text
+cap 2
+```
+
+DPU 日志应出现：
+
+```text
+Block device capacity updated: 2147483648 bytes (4194304 sectors)
+```
+
+Host 侧检查容量：
+
+```bash
+$HOST_SSH "blockdev --rereadpt /dev/vda || true"
+$HOST_SSH "blockdev --getsize64 /dev/vda"
+$HOST_SSH "lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL /dev/vda"
+```
+
+期望 `/dev/vda` 更新为 `2147483648` 字节，即 2GiB。
+
+### 4.6 常见错误
+
+| 日志/现象 | 处理方式 |
+| --- | --- |
+| `tlp_channel_start_cb failed: Failed to create VAR` | 检查并停止残留 `doca_vnet_pci_dev`/`doca_vblk_pci_dev`，同类 DevEmu/TLP 资源不能被多个进程同时占用 |
+| Host 已运行时在线 rescan 只能看到 bridge 或枚举失败 | 保持 DPU 进程运行后对 Host 执行 BMC power cycle |
+| `lspci` 看不到 `1af4:1042` endpoint | 确认 DPU 进程在 Host power cycle 前已启动并保持运行，且 DPU 日志出现 Host config read/write TLP |
+| Host 重启后 SSH 不通 | 确认 Host 管理 IP 仍在物理 PF/稳定接口上；100GbE 环境实测为 `192.168.0.100/24` 在 `eth1` |
+| 写入 `/dev/vda` 后读回内容不一致 | 当前样例读写后端仍是占位实现，这是预期限制；只用 direct read/write 成功返回作为 smoke test |
+| `--provider DPA` 初始化失败 | 改用 `--provider DPU` 复测，并保留完整 DOCA 日志继续定位 |
+
+## 5. 后续章节模板
 
 ```text
 ## N. applications/<name> 或 samples/<group>/<name>
