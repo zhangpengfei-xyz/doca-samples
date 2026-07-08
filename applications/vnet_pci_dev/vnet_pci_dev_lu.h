@@ -111,6 +111,9 @@ enum vnet_lu_msg {
 /** Shared memory region name for POSIX shm_open */
 #define VNET_LU_SHM_NAME "/vnet_live_update"
 
+/** Shared memory directory for OE export */
+#define VNET_LU_OE_SHM_DIR "/dev/shm/"
+
 /** Shared memory directory for TLP channel export */
 #define VNET_LU_CH_SHM_DIR "/dev/shm/vnet_lu_channel"
 

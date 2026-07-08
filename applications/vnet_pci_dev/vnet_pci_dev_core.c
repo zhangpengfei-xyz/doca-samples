@@ -2014,6 +2014,7 @@ static doca_error_t vnet_pci_dev_vnet_controller_create(struct tlp_context *tlp_
 	if (result == DOCA_SUCCESS) {
 		result = doca_devemu_vnet_offload_engine_create_from_export(import_desc,
 									    import_desc_len,
+									    VNET_LU_OE_SHM_DIR,
 									    pci_ep,
 									    &controller->offload_engine);
 		if (result != DOCA_SUCCESS) {
@@ -2039,6 +2040,12 @@ static doca_error_t vnet_pci_dev_vnet_controller_create(struct tlp_context *tlp_
 	}
 
 	if (!imported_offload) {
+		result = doca_devemu_virtio_offload_engine_set_shm_dir_path(virtio_engine, VNET_LU_OE_SHM_DIR);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to set OE shm_dir_path: %s", doca_error_get_descr(result));
+			goto destroy_offload_engine;
+		}
+
 		result = doca_devemu_vnet_offload_engine_set_mtu(controller->offload_engine, tlp_ctx->mtu);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to set MTU to %d: %s", tlp_ctx->mtu, doca_error_get_descr(result));
