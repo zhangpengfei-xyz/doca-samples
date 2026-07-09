@@ -93,12 +93,6 @@ struct vnet_dbg_state {
 	atomic_bool counters_in_progress;    /* True when counters collection is in progress */
 };
 
-/* Application resources */
-struct vnet_pci_dev_resources {
-	struct tlp_context *tlp_ctx;
-	volatile bool *force_quit;
-};
-
 /**
  * @brief VirtIO queue statistics reference - bundled for atomic publication.
  *
@@ -242,6 +236,10 @@ struct vnet_pci_dev_config {
 	int mq_core_idx;			       /* MQ start core (-1 = auto single core) */
 };
 
+extern volatile bool force_quit;
+extern struct vnet_pci_dev_config g_config;
+extern struct tlp_context *g_tlp_ctx;
+
 /**
  * @brief Initialize VQs according to library's embedded design
  *
@@ -341,15 +339,13 @@ doca_error_t vnet_pci_dev_initialize_io_context(struct vnet_pci_dev_controller *
  * initializes DOCA framework, creates VirtIO network devices, and runs
  * the main event processing loop until termination is requested.
  *
- * @param[in] config Application configuration containing PCI address, MAC, etc.
- * @param[in] force_quit Pointer to force quit flag for graceful shutdown
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  *
  * @note This function blocks until force_quit is set to true
  * @note Proper cleanup is performed regardless of exit reason
  * @note Created VirtIO device becomes visible after PCIe enumeration
  */
-doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool *force_quit);
+doca_error_t vnet_pci_dev_run(void);
 
 /**
  * @brief Destroy endpoint device during hotplug removal

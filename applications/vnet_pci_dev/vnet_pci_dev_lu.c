@@ -517,9 +517,9 @@ doca_error_t vnet_lu_active_init(void)
 	return vnet_lu_create_listen_socket(&vnet_lu_listen_fd);
 }
 
-static doca_error_t vnet_lu_handover(struct vnet_pci_dev_resources *resources)
+static doca_error_t vnet_lu_handover(void)
 {
-	struct tlp_context *tlp_ctx = resources->tlp_ctx;
+	struct tlp_context *tlp_ctx = g_tlp_ctx;
 	enum vnet_lu_msg msg;
 	doca_error_t result;
 	int conn_fd = -1;
@@ -640,13 +640,13 @@ out:
 	return result;
 }
 
-bool vnet_lu_active_post_loop(struct vnet_pci_dev_resources *resources)
+bool vnet_lu_active_post_loop(void)
 {
 	struct sigaction sa_dfl = {0};
 	bool did_handover = false;
 
 	if (vnet_lu_handover_requested) {
-		doca_error_t result = vnet_lu_handover(resources);
+		doca_error_t result = vnet_lu_handover();
 
 		did_handover = (result == DOCA_SUCCESS);
 		if (!did_handover)
@@ -1138,7 +1138,7 @@ close_ctx:
 
 /* Phase 1 (pre-copy): receive cmd_fd, open SHM, reconstruct doca_dev.
  * Called while App_A is still serving traffic. */
-doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources)
+doca_error_t vnet_lu_restore_early(void)
 {
 	const struct vnet_lu_device_state *ds0;
 	struct vnet_lu_shm *shm = NULL;
@@ -1146,8 +1146,8 @@ doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources)
 	size_t shm_size = 0;
 	int cmd_fd = -1;
 
-	if (!resources || !resources->tlp_ctx) {
-		DOCA_LOG_ERR("'resources' or 'tlp_ctx' is NULL");
+	if (!g_tlp_ctx) {
+		DOCA_LOG_ERR("'tlp_ctx' is NULL");
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
@@ -1189,7 +1189,7 @@ doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources)
 	}
 
 	DOCA_LOG_INFO("Restore early 4/4: reconstructing doca_dev");
-	result = vnet_lu_open_dev_from_cmd_fd(resources->tlp_ctx, cmd_fd);
+	result = vnet_lu_open_dev_from_cmd_fd(g_tlp_ctx, cmd_fd);
 	if (result != DOCA_SUCCESS) {
 		munmap(shm, shm_size);
 		goto cleanup_conn;
@@ -1198,7 +1198,7 @@ doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources)
 
 	ds0 = &shm->devices[0];
 	if (ds0->net.mtu > 0)
-		resources->tlp_ctx->mtu = ds0->net.mtu;
+		g_tlp_ctx->mtu = ds0->net.mtu;
 	if (ds0->virtio.max_queue_pairs == 0 || ds0->virtio.queue_size == 0) {
 		DOCA_LOG_ERR("SHM device 0: invalid config (max_queue_pairs=%u, queue_size=%u)",
 			     ds0->virtio.max_queue_pairs,
@@ -1207,9 +1207,9 @@ doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources)
 		result = DOCA_ERROR_INVALID_VALUE;
 		goto cleanup_conn;
 	}
-	resources->tlp_ctx->max_queue_pairs = ds0->virtio.max_queue_pairs;
-	resources->tlp_ctx->queue_size = ds0->virtio.queue_size;
-	memcpy(resources->tlp_ctx->mac_bytes_base, ds0->net.mac, ETH_ALEN);
+	g_tlp_ctx->max_queue_pairs = ds0->virtio.max_queue_pairs;
+	g_tlp_ctx->queue_size = ds0->virtio.queue_size;
+	memcpy(g_tlp_ctx->mac_bytes_base, ds0->net.mac, ETH_ALEN);
 
 	vnet_lu_saved_shm = shm;
 	vnet_lu_saved_shm_size = shm_size;
@@ -1352,14 +1352,14 @@ doca_error_t vnet_lu_find_existing_rep(struct doca_devemu_pci_type *pci_type,
 	return DOCA_ERROR_NOT_FOUND;
 }
 
-void vnet_lu_override_config(struct vnet_pci_dev_config *config, const struct tlp_context *tlp_ctx, uint8_t *mac_bytes)
+void vnet_lu_override_config(uint8_t *mac_bytes)
 {
-	config->max_queue_pairs = tlp_ctx->max_queue_pairs;
-	config->queue_size = tlp_ctx->queue_size;
-	config->mtu = tlp_ctx->mtu;
-	memcpy(mac_bytes, tlp_ctx->mac_bytes_base, ETH_ALEN);
-	snprintf(config->mac_addr,
-		 sizeof(config->mac_addr),
+	g_config.max_queue_pairs = g_tlp_ctx->max_queue_pairs;
+	g_config.queue_size = g_tlp_ctx->queue_size;
+	g_config.mtu = g_tlp_ctx->mtu;
+	memcpy(mac_bytes, g_tlp_ctx->mac_bytes_base, ETH_ALEN);
+	snprintf(g_config.mac_addr,
+		 sizeof(g_config.mac_addr),
 		 "%02x:%02x:%02x:%02x:%02x:%02x",
 		 mac_bytes[0],
 		 mac_bytes[1],
@@ -1369,10 +1369,10 @@ void vnet_lu_override_config(struct vnet_pci_dev_config *config, const struct tl
 		 mac_bytes[5]);
 
 	DOCA_LOG_INFO("LU standby: config overridden from SHM (qps=%u, qs=%u, mtu=%u, mac=%s)",
-		      config->max_queue_pairs,
-		      config->queue_size,
-		      config->mtu,
-		      config->mac_addr);
+		      g_config.max_queue_pairs,
+		      g_config.queue_size,
+		      g_config.mtu,
+		      g_config.mac_addr);
 }
 
 /*********************************************************************************************************************
@@ -1562,8 +1562,7 @@ static doca_error_t vnet_lu_replay_one_device(struct vnet_pci_dev_controller *ct
 	return DOCA_SUCCESS;
 }
 
-doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
-				    const struct vnet_lu_device_state *dev_states,
+doca_error_t vnet_pci_dev_lu_replay(const struct vnet_lu_device_state *dev_states,
 				    uint32_t num_devices)
 {
 	doca_error_t result;
@@ -1571,7 +1570,7 @@ doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
 	DOCA_LOG_INFO("LU replay: restoring %u devices from SHM state", num_devices);
 
 	for (uint32_t i = 0; i < num_devices; i++) {
-		result = vnet_lu_replay_one_device(&resources->tlp_ctx->vnet_controller[i], &dev_states[i], i);
+		result = vnet_lu_replay_one_device(&g_tlp_ctx->vnet_controller[i], &dev_states[i], i);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("LU replay: device %u failed: %s (%u/%u restored)",
 				     i,
@@ -1583,7 +1582,7 @@ doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
 	}
 
 	for (uint32_t i = 0; i < num_devices; i++) {
-		struct vnet_pci_dev_controller *ctrl = &resources->tlp_ctx->vnet_controller[i];
+		struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[i];
 		uint16_t sf_vhca_id = 0;
 
 		if (ctrl->offload_engine && vnet_lu_get_sf_vhca_id(ctrl->offload_engine, &sf_vhca_id) == DOCA_SUCCESS)
@@ -1594,7 +1593,7 @@ doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
 	return DOCA_SUCCESS;
 }
 
-doca_error_t vnet_lu_apply_shm_replay(struct vnet_pci_dev_resources *resources, struct vnet_pci_dev_config *config)
+doca_error_t vnet_lu_apply_shm_replay(void)
 {
 	const struct vnet_lu_shm *shm = vnet_lu_get_shm();
 	doca_error_t result;
@@ -1604,18 +1603,18 @@ doca_error_t vnet_lu_apply_shm_replay(struct vnet_pci_dev_resources *resources, 
 		return DOCA_ERROR_BAD_STATE;
 	}
 
-	if (shm->num_devices == 0 || shm->num_devices > resources->tlp_ctx->num_ep) {
+	if (shm->num_devices == 0 || shm->num_devices > g_tlp_ctx->num_ep) {
 		DOCA_LOG_ERR("LU: SHM num_devices (%u) exceeds allocated EPs (%u)",
 			     shm->num_devices,
-			     resources->tlp_ctx->num_ep);
+			     g_tlp_ctx->num_ep);
 		vnet_lu_release_shm();
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
-	config->num_ep = shm->num_devices;
-	resources->tlp_ctx->num_ep = shm->num_devices;
+	g_config.num_ep = shm->num_devices;
+	g_tlp_ctx->num_ep = shm->num_devices;
 
-	result = vnet_pci_dev_lu_replay(resources, shm->devices, shm->num_devices);
+	result = vnet_pci_dev_lu_replay(shm->devices, shm->num_devices);
 	vnet_lu_release_shm();
 	return result;
 }
@@ -1655,10 +1654,10 @@ static void *lu_enable_thread_fn(void *arg)
 	return NULL;
 }
 
-doca_error_t vnet_lu_phase2_enable_engines(struct vnet_pci_dev_resources *resources)
+doca_error_t vnet_lu_phase2_enable_engines(void)
 {
 	doca_error_t result = DOCA_SUCCESS;
-	uint32_t num_ep = resources->tlp_ctx->num_ep;
+	uint32_t num_ep = g_tlp_ctx->num_ep;
 	pthread_t threads[MAX_NUM_EP];
 	struct lu_enable_arg args[MAX_NUM_EP];
 	uint32_t spawned = 0;
@@ -1680,7 +1679,7 @@ doca_error_t vnet_lu_phase2_enable_engines(struct vnet_pci_dev_resources *resour
 			result = DOCA_ERROR_IO_FAILED;
 			goto join;
 		}
-		args[i].ctrl = &resources->tlp_ctx->vnet_controller[i];
+		args[i].ctrl = &g_tlp_ctx->vnet_controller[i];
 		args[i].idx = i;
 		args[i].result = DOCA_SUCCESS;
 
@@ -1728,9 +1727,9 @@ join:
  * Channel LU -- standby-side: receive export, create secondary channel, apply config, become primary
  *********************************************************************************************************************/
 
-doca_error_t vnet_lu_channel_restore(struct vnet_pci_dev_resources *resources)
+doca_error_t vnet_lu_channel_restore(void)
 {
-	struct tlp_context *tlp_ctx = resources->tlp_ctx;
+	struct tlp_context *tlp_ctx = g_tlp_ctx;
 	struct vnet_lu_channel_config ch_cfg;
 	union doca_data user_data = {0};
 	uint8_t success_flag = 0;

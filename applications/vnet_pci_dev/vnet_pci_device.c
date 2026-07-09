@@ -1927,16 +1927,16 @@ void pci_cfg_workqueue_submit_mq_start_qps(struct vnet_pci_dev_controller *contr
 
 static bool vnet_pci_device_data_vq_is_deferred(struct vnet_pci_device *dev, uint16_t vq_index)
 {
-	struct vnet_pci_dev_resources *resources;
+	struct tlp_context *tlp_ctx;
 	struct vnet_pci_dev_controller *controller;
 	uint16_t cvq_index;
 	uint16_t qp_idx;
 
-	resources = dev->cb_arg;
-	if (resources == NULL || resources->tlp_ctx == NULL)
+	tlp_ctx = dev->cb_arg;
+	if (tlp_ctx == NULL)
 		return false;
 
-	controller = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+	controller = &tlp_ctx->vnet_controller[dev->pf_index];
 	cvq_index = VNET_CVQ_INDEX(controller->max_queue_pairs);
 	if (vq_index >= cvq_index)
 		return false;
@@ -1948,23 +1948,23 @@ static bool vnet_pci_device_data_vq_is_deferred(struct vnet_pci_device *dev, uin
 
 static bool vnet_pci_device_reset_status_is_pending(struct vnet_pci_device *dev)
 {
-	struct vnet_pci_dev_resources *resources;
+	struct tlp_context *tlp_ctx;
 	struct vnet_pci_dev_controller *controller;
 
 	if (dev == NULL || dev->pf_index < 0)
 		return false;
 
-	resources = dev->cb_arg;
-	if (resources == NULL || resources->tlp_ctx == NULL || (uint32_t)dev->pf_index >= resources->tlp_ctx->num_ep)
+	tlp_ctx = dev->cb_arg;
+	if (tlp_ctx == NULL || (uint32_t)dev->pf_index >= tlp_ctx->num_ep)
 		return false;
 
-	controller = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+	controller = &tlp_ctx->vnet_controller[dev->pf_index];
 	return atomic_load(&controller->reset_status_state) != VNET_RESET_STATUS_IDLE;
 }
 
 static void vnet_pci_device_apply_reset_status_release(struct vnet_pci_device *dev)
 {
-	struct vnet_pci_dev_resources *resources;
+	struct tlp_context *tlp_ctx;
 	struct vnet_pci_dev_controller *controller;
 	struct vnet_virtio_common_config *pci_cfg;
 	uint32_t expected_state = VNET_RESET_STATUS_RELEASE_PENDING;
@@ -1972,11 +1972,11 @@ static void vnet_pci_device_apply_reset_status_release(struct vnet_pci_device *d
 	if (dev == NULL || dev->pf_index < 0)
 		return;
 
-	resources = dev->cb_arg;
-	if (resources == NULL || resources->tlp_ctx == NULL || (uint32_t)dev->pf_index >= resources->tlp_ctx->num_ep)
+	tlp_ctx = dev->cb_arg;
+	if (tlp_ctx == NULL || (uint32_t)dev->pf_index >= tlp_ctx->num_ep)
 		return;
 
-	controller = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+	controller = &tlp_ctx->vnet_controller[dev->pf_index];
 	if (!atomic_compare_exchange_strong(&controller->reset_status_state, &expected_state, VNET_RESET_STATUS_IDLE))
 		return;
 
@@ -6374,7 +6374,7 @@ void vnet_pci_device_vq_config(struct vnet_pci_device *dev, uint16_t vq_index)
 	/* CVQ index calculated from device's configured max_queue_pairs (from -q flag) */
 	uint16_t cvq_index = VNET_CVQ_INDEX(dev->vnet_cfg.max_virtqueue_pairs);
 	struct vnet_pci_dev_controller *controller;
-	struct vnet_pci_dev_resources *resources;
+	struct tlp_context *tlp_ctx;
 	struct vnet_virtio_common_config *common_cfg;
 	struct vnet_pci_device *active_dev;
 	struct doca_devemu_virtio_vq *vq_handle;
@@ -6389,16 +6389,16 @@ void vnet_pci_device_vq_config(struct vnet_pci_device *dev, uint16_t vq_index)
 	}
 
 	/* Get controller through callback arg with proper validation */
-	resources = dev->cb_arg;
-	if (!resources || !resources->tlp_ctx) {
-		DOCA_LOG_DBG("No resources/tlp_ctx available - VQ config will be applied later");
+	tlp_ctx = dev->cb_arg;
+	if (tlp_ctx == NULL) {
+		DOCA_LOG_DBG("No tlp_ctx available - VQ config will be applied later");
 		return;
 	}
-	if ((uint32_t)dev->pf_index >= resources->tlp_ctx->num_ep) {
-		DOCA_LOG_ERR("Invalid pf_index %d >= num_ep %u", dev->pf_index, resources->tlp_ctx->num_ep);
+	if ((uint32_t)dev->pf_index >= tlp_ctx->num_ep) {
+		DOCA_LOG_ERR("Invalid pf_index %d >= num_ep %u", dev->pf_index, tlp_ctx->num_ep);
 		return;
 	}
-	controller = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+	controller = &tlp_ctx->vnet_controller[dev->pf_index];
 	active_dev = atomic_load(&controller->virtio_device);
 	if (active_dev == NULL) {
 		DOCA_LOG_DBG("Controller not initialized - VQ config will be applied later");

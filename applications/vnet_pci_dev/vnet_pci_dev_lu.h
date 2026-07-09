@@ -38,8 +38,6 @@
 /* Forward declarations */
 struct doca_devemu_vnet_offload_engine;
 struct doca_devemu_pci_type;
-struct vnet_pci_dev_resources;
-struct vnet_pci_dev_config;
 struct doca_dev_rep;
 struct tlp_context;
 struct doca_dev;
@@ -236,7 +234,7 @@ struct vnet_lu_channel_config {
 doca_error_t vnet_lu_active_init(void);
 
 /** @brief Post-loop: run handover if SIGUSR1 was received, then cleanup */
-bool vnet_lu_active_post_loop(struct vnet_pci_dev_resources *resources);
+bool vnet_lu_active_post_loop(void);
 
 /** @brief Export all device state and offload engine blobs to SHM */
 doca_error_t vnet_lu_save_state(struct tlp_context *tlp_ctx);
@@ -251,7 +249,7 @@ doca_error_t vnet_lu_recv_cmd_fd(int sock_fd, int *fd_received);
 doca_error_t vnet_lu_get_cmd_fd(struct doca_dev *dev, int *cmd_fd_out);
 
 /** @brief Standby: connect to active, receive cmd_fd, open SHM, reconstruct doca_dev */
-doca_error_t vnet_lu_restore_early(struct vnet_pci_dev_resources *resources);
+doca_error_t vnet_lu_restore_early(void);
 
 /** @brief Return the mapped SHM pointer (valid between restore_early and release_shm) */
 const struct vnet_lu_shm *vnet_lu_get_shm(void);
@@ -292,17 +290,16 @@ doca_error_t vnet_lu_find_existing_rep(struct doca_devemu_pci_type *pci_type,
 				       struct doca_dev_rep **rep_out);
 
 /** @brief Override app config with SHM-restored values after restore_early */
-void vnet_lu_override_config(struct vnet_pci_dev_config *config, const struct tlp_context *tlp_ctx, uint8_t *mac_bytes);
+void vnet_lu_override_config(uint8_t *mac_bytes);
 
 /** @brief Phase 1: Validate SHM, override num_ep, replay VQs (start_vqs, no enable), release SHM */
-doca_error_t vnet_lu_apply_shm_replay(struct vnet_pci_dev_resources *resources, struct vnet_pci_dev_config *config);
+doca_error_t vnet_lu_apply_shm_replay(void);
 
 /** @brief Phase 2: Parallel per-device enable -- spawns a thread per 'G' received, joins all */
-doca_error_t vnet_lu_phase2_enable_engines(struct vnet_pci_dev_resources *resources);
+doca_error_t vnet_lu_phase2_enable_engines(void);
 
 /** @brief Replay saved device state from SHM (VQ addresses, features, OE start) */
-doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
-				    const struct vnet_lu_device_state *dev_states,
+doca_error_t vnet_pci_dev_lu_replay(const struct vnet_lu_device_state *dev_states,
 				    uint32_t num_devices);
 
 /*********************************************************************************************************************
@@ -314,6 +311,6 @@ doca_error_t vnet_pci_dev_lu_replay(struct vnet_pci_dev_resources *resources,
 doca_error_t vnet_lu_channel_enable_export(struct doca_devemu_pci_tlp_channel *tlp_channel);
 
 /** @brief Standby: receive export, create secondary channel, apply config, become primary */
-doca_error_t vnet_lu_channel_restore(struct vnet_pci_dev_resources *resources);
+doca_error_t vnet_lu_channel_restore(void);
 
 #endif /* VNET_PCI_DEV_LU_H_ */

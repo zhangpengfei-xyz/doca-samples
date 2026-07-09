@@ -44,7 +44,22 @@
 DOCA_LOG_REGISTER(VNET_PCI_DEV);
 
 /* Global signal handling */
-static volatile bool force_quit = false;
+volatile bool force_quit = false;
+
+struct vnet_pci_dev_config g_config = {.pci_address = "0000:03:00.0",   /* Default PCI address (full format) */
+				       .ibdev_name = "",		    /* Empty = use pci_address */
+				       .mac_addr = "52:54:00:12:34:56", /* Default MAC */
+				       .mtu = 1500,
+				       .speed = 100000,			/* 100 Gbps for Gen5 */
+				       .duplex = 1,			/* Full duplex */
+				       .max_queue_pairs = VNET_MAX_QUEUE_PAIRS, /* Default Max QPs */
+				       .queue_size = VNET_DEFAULT_QUEUE_SIZE,   /* Default queue size */
+				       .num_ep = 1,		       /* Default Number of Endpoints (1) */
+				       .hotplug_mode = true,		       /* Default: hotplug mode */
+				       .vnet_lu_mode = VNET_LU_MODE_NONE,       /* Default LU Mode (none) */
+				       .tlp_core_idx = -1,		       /* Auto affinity */
+				       .worker_core_idx = -1,		       /* Auto affinity */
+				       .mq_core_idx = -1};		       /* Auto single-core affinity */
 
 /**
  * @brief Signal handler for graceful shutdown
@@ -673,20 +688,6 @@ static doca_error_t register_vnet_pci_dev_params(void)
  */
 int main(int argc, char **argv)
 {
-	struct vnet_pci_dev_config config = {.pci_address = "0000:03:00.0",   /* Default PCI address (full format) */
-					     .ibdev_name = "",		      /* Empty = use pci_address */
-					     .mac_addr = "52:54:00:12:34:56", /* Default MAC */
-					     .mtu = 1500,
-					     .speed = 100000,			      /* 100 Gbps for Gen5 */
-					     .duplex = 1,			      /* Full duplex */
-					     .max_queue_pairs = VNET_MAX_QUEUE_PAIRS, /* Default Max QPs */
-					     .queue_size = VNET_DEFAULT_QUEUE_SIZE,   /* Default queue size */
-					     .num_ep = 1,			/* Default Number of Endpoints (1) */
-					     .hotplug_mode = true,		/* Default: hotplug mode */
-					     .vnet_lu_mode = VNET_LU_MODE_NONE, /* Default LU Mode (none) */
-					     .tlp_core_idx = -1,		/* Auto affinity */
-					     .worker_core_idx = -1,		/* Auto affinity */
-					     .mq_core_idx = -1};		/* Auto single-core affinity */
 	struct doca_log_backend *sdk_log;
 	int exit_status = EXIT_FAILURE;
 	doca_error_t result;
@@ -707,7 +708,7 @@ int main(int argc, char **argv)
 	DOCA_LOG_INFO("Starting DOCA VirtIO Net PCI Device application");
 
 	/* Parse application arguments */
-	result = doca_argp_init("doca_vnet_pci_dev", &config);
+	result = doca_argp_init("doca_vnet_pci_dev", &g_config);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init ARGP resources: %s", doca_error_get_descr(result));
 		return EXIT_FAILURE;
@@ -725,14 +726,14 @@ int main(int argc, char **argv)
 		goto destroy_argp;
 	}
 
-	if (config.tlp_core_idx >= 0 && config.tlp_core_idx == config.worker_core_idx) {
+	if (g_config.tlp_core_idx >= 0 && g_config.tlp_core_idx == g_config.worker_core_idx) {
 		DOCA_LOG_ERR("tlp-core (%d) must not equal worker-core (%d)",
-			     config.tlp_core_idx,
-			     config.worker_core_idx);
+			     g_config.tlp_core_idx,
+			     g_config.worker_core_idx);
 		goto destroy_argp;
 	}
-	if (config.mq_core_idx >= 0 && config.mq_core_idx == config.tlp_core_idx) {
-		DOCA_LOG_ERR("mq-core (%d) must not equal tlp-core (%d)", config.mq_core_idx, config.tlp_core_idx);
+	if (g_config.mq_core_idx >= 0 && g_config.mq_core_idx == g_config.tlp_core_idx) {
+		DOCA_LOG_ERR("mq-core (%d) must not equal tlp-core (%d)", g_config.mq_core_idx, g_config.tlp_core_idx);
 		goto destroy_argp;
 	}
 
@@ -743,37 +744,37 @@ int main(int argc, char **argv)
 	signal(SIGTERM, signal_handler);
 
 	DOCA_LOG_INFO("Configuration:");
-	if (config.ibdev_name[0] != '\0')
-		DOCA_LOG_INFO("  IB Device: %s (overrides PCI address)", config.ibdev_name);
+	if (g_config.ibdev_name[0] != '\0')
+		DOCA_LOG_INFO("  IB Device: %s (overrides PCI address)", g_config.ibdev_name);
 	else
-		DOCA_LOG_INFO("  PCI Address: %s", config.pci_address);
-	DOCA_LOG_INFO("  MAC Address: %s", config.mac_addr);
-	DOCA_LOG_INFO("  MTU: %u", config.mtu);
-	DOCA_LOG_INFO("  Speed: %u Mbps", config.speed);
-	DOCA_LOG_INFO("  Duplex: %s", config.duplex ? "Full" : "Half");
-	DOCA_LOG_INFO("  Max Queue Pairs: %u (Total VQs: %u)", config.max_queue_pairs, config.max_queue_pairs * 2 + 1);
-	DOCA_LOG_INFO("  Queue Size: %u entries", config.queue_size);
-	DOCA_LOG_INFO("  Number of Endpoints: %u", config.num_ep);
-	DOCA_LOG_INFO("  Hotplug Mode: %s", config.hotplug_mode ? "Hotplug" : "Static");
-	if (config.tlp_core_idx < 0)
+		DOCA_LOG_INFO("  PCI Address: %s", g_config.pci_address);
+	DOCA_LOG_INFO("  MAC Address: %s", g_config.mac_addr);
+	DOCA_LOG_INFO("  MTU: %u", g_config.mtu);
+	DOCA_LOG_INFO("  Speed: %u Mbps", g_config.speed);
+	DOCA_LOG_INFO("  Duplex: %s", g_config.duplex ? "Full" : "Half");
+	DOCA_LOG_INFO("  Max Queue Pairs: %u (Total VQs: %u)", g_config.max_queue_pairs, g_config.max_queue_pairs * 2 + 1);
+	DOCA_LOG_INFO("  Queue Size: %u entries", g_config.queue_size);
+	DOCA_LOG_INFO("  Number of Endpoints: %u", g_config.num_ep);
+	DOCA_LOG_INFO("  Hotplug Mode: %s", g_config.hotplug_mode ? "Hotplug" : "Static");
+	if (g_config.tlp_core_idx < 0)
 		DOCA_LOG_INFO("  TLP Core: auto");
 	else
-		DOCA_LOG_INFO("  TLP Core: %d", config.tlp_core_idx);
-	if (config.worker_core_idx < 0)
+		DOCA_LOG_INFO("  TLP Core: %d", g_config.tlp_core_idx);
+	if (g_config.worker_core_idx < 0)
 		DOCA_LOG_INFO("  Worker Core: auto");
 	else
-		DOCA_LOG_INFO("  Worker Core: %d", config.worker_core_idx);
-	if (config.mq_core_idx < 0)
+		DOCA_LOG_INFO("  Worker Core: %d", g_config.worker_core_idx);
+	if (g_config.mq_core_idx < 0)
 		DOCA_LOG_INFO("  MQ Core: auto (single CPU)");
 	else
-		DOCA_LOG_INFO("  MQ Core: %d", config.mq_core_idx);
+		DOCA_LOG_INFO("  MQ Core: %d", g_config.mq_core_idx);
 	DOCA_LOG_INFO("  LU Mode: %s",
-		      config.vnet_lu_mode == VNET_LU_MODE_ACTIVE  ? "active" :
-		      config.vnet_lu_mode == VNET_LU_MODE_STANDBY ? "standby" :
+		      g_config.vnet_lu_mode == VNET_LU_MODE_ACTIVE  ? "active" :
+		      g_config.vnet_lu_mode == VNET_LU_MODE_STANDBY ? "standby" :
 								    "none");
 
 	/* Run the core VirtIO Net PCI device logic */
-	result = vnet_pci_dev_run(&config, &force_quit);
+	result = vnet_pci_dev_run();
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("VirtIO Net PCI device failed: %s", doca_error_get_descr(result));
 		goto destroy_argp;

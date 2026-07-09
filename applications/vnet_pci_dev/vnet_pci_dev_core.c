@@ -58,6 +58,8 @@
 
 DOCA_LOG_REGISTER(VNET_PCI_DEV_CORE);
 
+struct tlp_context *g_tlp_ctx = NULL;
+
 #define STATS_POLL_INTERVAL_USEC 10000	 /* 10ms polling interval for stats populate completion */
 #define MAX_CLEANUP_WAIT_ITERATIONS 1000 /* 10 seconds at 10ms per iteration for cleanup timeout */
 #define UNPLUG_TIMEOUT_SEC 30		 /* Seconds to wait for host Power OFF before forcing unplug */
@@ -1885,8 +1887,7 @@ static doca_error_t vnet_controller_query_and_display_rep_info(struct vnet_pci_d
 	return DOCA_SUCCESS;
 }
 
-static doca_error_t vnet_pci_dev_vnet_controller_init(struct vnet_pci_dev_resources *resources,
-						      struct vnet_pci_dev_config *config)
+static doca_error_t vnet_pci_dev_vnet_controller_init(void)
 {
 	doca_error_t result;
 
@@ -1894,8 +1895,8 @@ static doca_error_t vnet_pci_dev_vnet_controller_init(struct vnet_pci_dev_resour
 	 * Note: stats_ref_mutex is already initialized in init_tlp_context() immediately
 	 * after allocation, so tlp_ctx_cleanup() can safely destroy it on any failure path.
 	 */
-	for (uint32_t i = 0; i < resources->tlp_ctx->num_ep; i++) {
-		struct vnet_pci_dev_controller *ctrl = &resources->tlp_ctx->vnet_controller[i];
+	for (uint32_t i = 0; i < g_tlp_ctx->num_ep; i++) {
+		struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[i];
 		atomic_init(&ctrl->virtio_device, NULL);
 		atomic_init(&ctrl->shutting_down, false);
 		atomic_init(&ctrl->stop_stats_collection, false);
@@ -1920,7 +1921,7 @@ static doca_error_t vnet_pci_dev_vnet_controller_init(struct vnet_pci_dev_resour
 	}
 
 	/* Initialize VNet subsystem */
-	result = doca_devemu_vnet_add_dev(resources->tlp_ctx->dev);
+	result = doca_devemu_vnet_add_dev(g_tlp_ctx->dev);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to add device to VNet subsystem: %s", doca_error_get_descr(result));
 		return result;
@@ -1932,15 +1933,15 @@ static doca_error_t vnet_pci_dev_vnet_controller_init(struct vnet_pci_dev_resour
 		goto rm_dev;
 	}
 
-	/* Parse MAC address from config->mac_addr */
-	result = parse_mac_address(config->mac_addr, resources->tlp_ctx->mac_bytes_base);
+	/* Parse MAC address from g_config.mac_addr */
+	result = parse_mac_address(g_config.mac_addr, g_tlp_ctx->mac_bytes_base);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to parse MAC address '%s': %s", config->mac_addr, doca_error_get_descr(result));
+		DOCA_LOG_ERR("Failed to parse MAC address '%s': %s", g_config.mac_addr, doca_error_get_descr(result));
 		goto teardown_vnet;
 	}
-	resources->tlp_ctx->max_queue_pairs = config->max_queue_pairs;
-	resources->tlp_ctx->queue_size = config->queue_size;
-	resources->tlp_ctx->mtu = config->mtu;
+	g_tlp_ctx->max_queue_pairs = g_config.max_queue_pairs;
+	g_tlp_ctx->queue_size = g_config.queue_size;
+	g_tlp_ctx->mtu = g_config.mtu;
 
 	DOCA_LOG_INFO("VNet controller init - waiting for host configuration");
 	return DOCA_SUCCESS;
@@ -1948,7 +1949,7 @@ static doca_error_t vnet_pci_dev_vnet_controller_init(struct vnet_pci_dev_resour
 teardown_vnet:
 	doca_devemu_vnet_teardown();
 rm_dev:
-	doca_devemu_vnet_rm_dev(resources->tlp_ctx->dev);
+	doca_devemu_vnet_rm_dev(g_tlp_ctx->dev);
 	return result;
 }
 
@@ -1958,17 +1959,16 @@ rm_dev:
  * Destroys VNet controller using the library's intended workflow with
  * proper error handling and API contract compliance.
  *
- * @param[in] resources Application resources
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  */
-static doca_error_t vnet_pci_dev_vnet_controller_uninit(struct vnet_pci_dev_resources *resources)
+static doca_error_t vnet_pci_dev_vnet_controller_uninit(void)
 {
 	/* With dual PE architecture, IO contexts are destroyed immediately in cleanup,
 	 * so no pending contexts to handle here. */
 
 	/* Cleanup VNet subsystem */
 	doca_devemu_vnet_teardown();
-	doca_devemu_vnet_rm_dev(resources->tlp_ctx->dev);
+	doca_devemu_vnet_rm_dev(g_tlp_ctx->dev);
 
 	return DOCA_SUCCESS;
 }
@@ -2155,7 +2155,8 @@ destroy_offload_engine:
  * Destroys VNet controller using the library's intended workflow with
  * proper error handling and API contract compliance.
  *
- * @param[in] resources Application resources
+ * @param[in] tlp_ctx TLP context
+ * @param[in] endpoint Endpoint device configuration
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  */
 static doca_error_t vnet_pci_dev_vnet_controller_destroy(struct tlp_context *tlp_ctx,
@@ -2917,13 +2918,14 @@ static void vnet_pci_dev_force_reset(struct vnet_virtio_common_config *pci_cfg, 
 static void virtio_net_ctrl_change_cb(struct vnet_pci_device *dev, void *arg)
 {
 	struct vnet_virtio_common_config *pci_cfg = vnet_pci_device_get_pci_cfg(dev);
-	struct vnet_pci_dev_resources *resources = arg;
 	/* Use per-device prev_status instead of static variable for multi-device support */
 	uint8_t prev_status = dev->prev_status;
 
-	if (pci_cfg->device_status == 0 && resources && resources->tlp_ctx && dev->pf_index >= 0 &&
-	    (uint32_t)dev->pf_index < resources->tlp_ctx->num_ep) {
-		struct vnet_pci_dev_controller *ctrl = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+	(void)arg;
+
+	if (pci_cfg->device_status == 0 && g_tlp_ctx && dev->pf_index >= 0 &&
+	    (uint32_t)dev->pf_index < g_tlp_ctx->num_ep) {
+		struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[dev->pf_index];
 
 		if (atomic_load(&ctrl->reset_status_state) == VNET_RESET_STATUS_HELD) {
 			pci_cfg->device_status = VNET_VIRTIO_DEVICE_STATUS_NEEDS_RESET;
@@ -2939,11 +2941,10 @@ static void virtio_net_ctrl_change_cb(struct vnet_pci_device *dev, void *arg)
 			      dev->device,
 			      dev->function);
 
-		if (resources && resources->tlp_ctx && dev->pf_index >= 0 &&
-		    (uint32_t)dev->pf_index < resources->tlp_ctx->num_ep) {
-			struct vnet_pci_dev_controller *ctrl = &resources->tlp_ctx->vnet_controller[dev->pf_index];
+		if (g_tlp_ctx && dev->pf_index >= 0 && (uint32_t)dev->pf_index < g_tlp_ctx->num_ep) {
+			struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[dev->pf_index];
 			struct pci_device_config *endpoint =
-				&resources->tlp_ctx->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + dev->pf_index];
+				&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + dev->pf_index];
 
 			/* Don't interfere if application is shutting down */
 			if (atomic_load(&ctrl->shutting_down)) {
@@ -3030,13 +3031,11 @@ static void virtio_net_ctrl_change_cb(struct vnet_pci_device *dev, void *arg)
 				dev->function);
 
 			/* VirtIO Spec Compliance: Start hardware preparation during FEATURES_OK phase */
-			if (resources && resources->tlp_ctx && dev->pf_index >= 0 &&
-			    (uint32_t)dev->pf_index < resources->tlp_ctx->num_ep) {
+			if (g_tlp_ctx && dev->pf_index >= 0 && (uint32_t)dev->pf_index < g_tlp_ctx->num_ep) {
 				struct vnet_pci_dev_controller *ctrl =
-					&resources->tlp_ctx->vnet_controller[dev->pf_index];
+					&g_tlp_ctx->vnet_controller[dev->pf_index];
 				struct pci_device_config *endpoint =
-					&resources->tlp_ctx
-						 ->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + dev->pf_index];
+					&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + dev->pf_index];
 				bool has_cvq, has_mq;
 
 				/* Allow FEATURES_OK even when pending_unplug is set.
@@ -3076,9 +3075,9 @@ static void virtio_net_ctrl_change_cb(struct vnet_pci_device *dev, void *arg)
 					DOCA_LOG_INFO(
 						"MQ features negotiated: F_CTRL_VQ + F_MQ -- CVQ + MQ support enabled");
 					atomic_store(&ctrl->num_active_qps, VNET_DEFAULT_QUEUE_PAIRS);
-					ctrl->max_queue_pairs = resources->tlp_ctx->max_queue_pairs;
+					ctrl->max_queue_pairs = g_tlp_ctx->max_queue_pairs;
 					atomic_store(&ctrl->deferred_mq.initial_data_qps_deferred,
-						     vnet_tlp_ctx_should_defer_mq_start(resources->tlp_ctx));
+						     vnet_tlp_ctx_should_defer_mq_start(g_tlp_ctx));
 				} else {
 					DOCA_LOG_INFO("MQ features NOT negotiated (CTRL_VQ=%d, MQ=%d) - single QP mode",
 						      has_cvq,
@@ -3123,12 +3122,11 @@ features_ok_done:;
 	/* VirtIO DRIVER_OK State - Make Device Operational */
 	if ((pci_cfg->device_status & VNET_VIRTIO_DEVICE_STATUS_DRIVER_OK) &&
 	    !(prev_status & VNET_VIRTIO_DEVICE_STATUS_DRIVER_OK)) {
-		if (resources && resources->tlp_ctx && dev->pf_index >= 0 &&
-		    (uint32_t)dev->pf_index < resources->tlp_ctx->num_ep) {
+		if (g_tlp_ctx && dev->pf_index >= 0 && (uint32_t)dev->pf_index < g_tlp_ctx->num_ep) {
 			struct vnet_pci_dev_controller *controller =
-				&resources->tlp_ctx->vnet_controller[dev->pf_index];
+				&g_tlp_ctx->vnet_controller[dev->pf_index];
 			struct pci_device_config *endpoint =
-				&resources->tlp_ctx->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + dev->pf_index];
+				&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + dev->pf_index];
 			const struct vnet_virtio_net_config *net_cfg = vnet_pci_device_get_vnet_dev_cfg(dev);
 			const struct vnet_virtio_queue_config *vqs = vnet_pci_device_get_virtq_pci_cfg(dev);
 			uint8_t enabled_queues = 0;
@@ -4436,23 +4434,19 @@ static doca_error_t init_transaction_region(struct tlp_context *tlp_ctx, size_t 
 /*
  * Initialize VirtIO network device
  *
- * @resources [in/out]: Application resources
- * @config [in]: Application configuration
  * @mac_bytes [in]: MAC address bytes
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *resources,
-					       struct vnet_pci_dev_config *config,
-					       uint8_t *mac_bytes)
+static doca_error_t init_virtio_network_device(uint8_t *mac_bytes)
 {
 	struct vnet_virtio_net_config net_cfg = {0};
 	struct vnet_pci_device_attrs attr = {0};
 	union doca_data user_data = {0};
-	bool skip_tlp_channel = vnet_lu_is_standby(config->vnet_lu_mode);
+	bool skip_tlp_channel = vnet_lu_is_standby(g_config.vnet_lu_mode);
 	doca_error_t result;
 
 	/* Initialize vnet_pci_dev framework */
-	result = vnet_pci_dev_init(resources->tlp_ctx);
+	result = vnet_pci_dev_init(g_tlp_ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize vnet_pci_dev framework: %s", doca_error_get_descr(result));
 		return result;
@@ -4463,21 +4457,21 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	 * TLP channel via channel LU (create_from_export) after device LU. */
 	if (!skip_tlp_channel) {
 		/* Start vnet_pci_dev TLP channel (creates the channel) */
-		result = vnet_pci_dev_start(resources->tlp_ctx);
+		result = vnet_pci_dev_start(g_tlp_ctx);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to start vnet_pci_dev: %s", doca_error_get_descr(result));
 			goto cleanup_vnet_pci_dev;
 		}
 
 		/* Active LU: enable channel export for future handover */
-		if (vnet_lu_is_enabled(config->vnet_lu_mode)) {
-			result = vnet_lu_channel_enable_export(resources->tlp_ctx->tlp_channel);
+		if (vnet_lu_is_enabled(g_config.vnet_lu_mode)) {
+			result = vnet_lu_channel_enable_export(g_tlp_ctx->tlp_channel);
 			if (result != DOCA_SUCCESS)
 				goto cleanup_vnet_pci_dev_stop;
 		}
 
 		/* Connect vnet_pci_dev event channel to progress engine */
-		result = doca_pe_connect_ctx(resources->tlp_ctx->pe, vnet_pci_dev_tlp_channel_ctx(resources->tlp_ctx));
+		result = doca_pe_connect_ctx(g_tlp_ctx->pe, vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx));
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to attach vnet_pci_dev context to progress engine: %s",
 				     doca_error_get_descr(result));
@@ -4485,13 +4479,13 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 		}
 
 		/* Set user data for TLP channel context */
-		user_data.ptr = resources->tlp_ctx;
-		result = doca_ctx_set_user_data(vnet_pci_dev_tlp_channel_ctx(resources->tlp_ctx), user_data);
+		user_data.ptr = g_tlp_ctx;
+		result = doca_ctx_set_user_data(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx), user_data);
 		if (result != DOCA_SUCCESS) {
 			goto cleanup_vnet_pci_dev_stop;
 		}
 		/* Start the TLP channel context after PE connection */
-		result = doca_ctx_start(vnet_pci_dev_tlp_channel_ctx(resources->tlp_ctx));
+		result = doca_ctx_start(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx));
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to start TLP channel context: %s", doca_error_get_descr(result));
 			goto cleanup_vnet_pci_dev_stop;
@@ -4502,7 +4496,7 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 		 * N (emulated endpoints from -n) is unaffected by this check. */
 		uint8_t num_nv_switch_tlp_dsp = 0;
 
-		result = doca_devemu_pci_tlp_channel_get_num_dsp(resources->tlp_ctx->tlp_channel,
+		result = doca_devemu_pci_tlp_channel_get_num_dsp(g_tlp_ctx->tlp_channel,
 								 &num_nv_switch_tlp_dsp);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to get num_dsp: %s", doca_error_get_descr(result));
@@ -4518,7 +4512,7 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 		}
 
 		/* Initialize ACG queue for MSI interrupt credits */
-		result = init_acg_queue(resources->tlp_ctx);
+		result = init_acg_queue(g_tlp_ctx);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to initialize ACG queue: %s", doca_error_get_descr(result));
 			goto cleanup_vnet_pci_dev_stop;
@@ -4528,11 +4522,11 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	}
 
 	/* Initialize device topology (software configuration) */
-	init_device_topology(resources->tlp_ctx);
+	init_device_topology(g_tlp_ctx);
 
 	/* Initialize VNet controller subsystem first (required before creating devices) */
 	DOCA_LOG_INFO("About to call vnet_pci_dev_vnet_controller_init");
-	result = vnet_pci_dev_vnet_controller_init(resources, config);
+	result = vnet_pci_dev_vnet_controller_init();
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize VNet controller: %s", doca_error_get_descr(result));
 		goto cleanup_vnet_pci_dev_stop;
@@ -4541,10 +4535,10 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	/* Configure network device */
 	memcpy(net_cfg.mac, mac_bytes, ETH_ALEN);
 	net_cfg.status = VIRTIO_NET_S_LINK_UP;		       /* Link up */
-	net_cfg.max_virtqueue_pairs = config->max_queue_pairs; /* Max queue pairs (VirtIO MQ) */
-	net_cfg.mtu = config->mtu;
-	net_cfg.speed = config->speed;
-	net_cfg.duplex = config->duplex;
+	net_cfg.max_virtqueue_pairs = g_config.max_queue_pairs; /* Max queue pairs (VirtIO MQ) */
+	net_cfg.mtu = g_config.mtu;
+	net_cfg.speed = g_config.speed;
+	net_cfg.duplex = g_config.duplex;
 	net_cfg.rss_max_key_size = 40;
 	net_cfg.rss_max_indirection_table_length = 128;
 	net_cfg.supported_hash_types = 0x3F; /* Support common hash types */
@@ -4552,27 +4546,27 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	/* Create VirtIO network device - calculate total VQs from queue pairs
 	 * NOTE: Must be done BEFORE create_all_devices() because
 	 * vnet_pci_dev_vnet_controller_create() needs virtio_dev array initialized */
-	attr.num_queues = config->max_queue_pairs * 2 + 1; /* RX + TX per pair + CVQ */
-	attr.queue_size = config->queue_size;		   /* VirtQueue size (entries per queue) */
+	attr.num_queues = g_config.max_queue_pairs * 2 + 1; /* RX + TX per pair + CVQ */
+	attr.queue_size = g_config.queue_size;		   /* VirtQueue size (entries per queue) */
 	attr.virtio_type = VNET_VIRTIO_NETWORK_DEVICE;
 	attr.device_features = VNET_PCI_DEV_DEFAULT_FEATURES;
 	attr.dev_cfg = &net_cfg;
 	attr.pci_cfg_change_cb = virtio_net_ctrl_change_cb;
-	attr.cb_arg = resources;
+	attr.cb_arg = g_tlp_ctx;
 
 	DOCA_LOG_DBG("Creating VirtIO device with features: MAC + STATUS + CSUM + MTU (0x%lx)",
 		     (unsigned long)VNET_PCI_DEV_DEFAULT_FEATURES);
 
-	result = vnet_pci_device_create(resources->tlp_ctx, &attr);
+	result = vnet_pci_device_create(g_tlp_ctx, &attr);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to create VirtIO network device: %s", doca_error_get_descr(result));
 		goto cleanup_vnet_controller_init;
 	}
 
 	/* Create all devices in static mode */
-	if (!resources->tlp_ctx->hotplug_mode) {
-		DOCA_LOG_INFO("Static Mode: Creating all %u EPs at startup", resources->tlp_ctx->num_ep);
-		result = create_all_devices(resources->tlp_ctx, config->vnet_lu_mode);
+	if (!g_tlp_ctx->hotplug_mode) {
+		DOCA_LOG_INFO("Static Mode: Creating all %u EPs at startup", g_tlp_ctx->num_ep);
+		result = create_all_devices(g_tlp_ctx, g_config.vnet_lu_mode);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to create devices: %s", doca_error_get_descr(result));
 			goto cleanup_virtio_device;
@@ -4582,7 +4576,7 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	}
 
 	/* Initialize transaction region for MMIO */
-	result = init_transaction_region(resources->tlp_ctx, TRANSACTION_REGION_SIZE);
+	result = init_transaction_region(g_tlp_ctx, TRANSACTION_REGION_SIZE);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize transaction region: %s", doca_error_get_descr(result));
 		goto cleanup_virtio_device;
@@ -4592,27 +4586,26 @@ static doca_error_t init_virtio_network_device(struct vnet_pci_dev_resources *re
 	return DOCA_SUCCESS;
 
 cleanup_virtio_device:
-	for (uint32_t i = 0; i < resources->tlp_ctx->num_ep; i++) {
-		vnet_pci_device_destroy(&resources->tlp_ctx->virtio_dev[i]);
+	for (uint32_t i = 0; i < g_tlp_ctx->num_ep; i++) {
+		vnet_pci_device_destroy(&g_tlp_ctx->virtio_dev[i]);
 	}
 
 cleanup_vnet_controller_init:
-	doca_ctx_stop(vnet_pci_dev_tlp_channel_ctx(resources->tlp_ctx));
-	vnet_pci_dev_vnet_controller_uninit(resources);
+	doca_ctx_stop(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx));
+	vnet_pci_dev_vnet_controller_uninit();
 
 cleanup_vnet_pci_dev_stop:
-	vnet_pci_dev_stop(resources->tlp_ctx);
+	vnet_pci_dev_stop(g_tlp_ctx);
 cleanup_vnet_pci_dev:
-	vnet_pci_dev_reset(resources->tlp_ctx);
+	vnet_pci_dev_reset(g_tlp_ctx);
 	return result;
 }
 
 /*
  * Cleanup VirtIO network device
  *
- * @resources [in]: Application resources
  */
-static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resources)
+static void cleanup_virtio_network_device(void)
 {
 	bool destroyed_all_offloads = true;
 	doca_error_t result;
@@ -4623,9 +4616,9 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 	pci_cfg_workqueue_shutdown();
 
 	/* Destroy VirtIO devices (this frees vqs arrays) */
-	if (resources->tlp_ctx->num_ep) {
-		for (i = 0; i < resources->tlp_ctx->num_ep; i++) {
-			vnet_pci_device_destroy(&resources->tlp_ctx->virtio_dev[i]);
+	if (g_tlp_ctx->num_ep) {
+		for (i = 0; i < g_tlp_ctx->num_ep; i++) {
+			vnet_pci_device_destroy(&g_tlp_ctx->virtio_dev[i]);
 		}
 		DOCA_LOG_INFO("VNet device destroyed successfully");
 	}
@@ -4636,10 +4629,10 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 		 * destroying the active-side offload-engine object after handover, so
 		 * do that here before tearing down the process-global VNET state. */
 		DOCA_LOG_INFO("LU active: destroying stopped offload engines and releasing per-process handles");
-		for (i = 0; i < resources->tlp_ctx->num_ep; i++) {
+		for (i = 0; i < g_tlp_ctx->num_ep; i++) {
 			struct pci_device_config *ep =
-				&resources->tlp_ctx->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + i];
-			struct vnet_pci_dev_controller *ctrl = &resources->tlp_ctx->vnet_controller[i];
+				&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + i];
+			struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[i];
 			doca_error_t err;
 
 			if (ctrl->offload_engine != NULL) {
@@ -4682,7 +4675,7 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 		}
 
 		if (destroyed_all_offloads) {
-			result = vnet_pci_dev_vnet_controller_uninit(resources);
+				result = vnet_pci_dev_vnet_controller_uninit();
 			if (result != DOCA_SUCCESS)
 				DOCA_LOG_ERR("LU active: VNet controller uninit failed: %s",
 					     doca_error_get_descr(result));
@@ -4693,25 +4686,25 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 				"LU active: skipping VNet controller uninit because offload-engine destroy failed");
 	} else {
 		/* Normal cleanup: full device destruction */
-		for (i = 0; i < resources->tlp_ctx->num_ep; i++) {
+		for (i = 0; i < g_tlp_ctx->num_ep; i++) {
 			struct pci_device_config *ep =
-				&resources->tlp_ctx->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + i];
+				&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + i];
 			if (atomic_load(&ep->device_present) || ep->rep != NULL || ep->tlp_dev != NULL) {
 				DOCA_LOG_INFO("Cleaning up EP %u", i);
-				(void)vnet_pci_dev_destroy_device(resources->tlp_ctx, ep);
+				(void)vnet_pci_dev_destroy_device(g_tlp_ctx, ep);
 			}
 		}
-		result = vnet_pci_dev_vnet_controller_uninit(resources);
+			result = vnet_pci_dev_vnet_controller_uninit();
 		if (result != DOCA_SUCCESS)
 			DOCA_LOG_ERR("VNet controller destroy failed: %s", doca_error_get_descr(result));
 		else
 			DOCA_LOG_INFO("VNet controller destroyed successfully");
 	}
 
-	if (resources->tlp_ctx->acg_queue != NULL) {
+	if (g_tlp_ctx->acg_queue != NULL) {
 		struct doca_devemu_pci_tlp_channel_req *acg_req;
 		uint16_t count = 0;
-		while ((acg_req = acg_queue_pop(resources->tlp_ctx)) != NULL) {
+		while ((acg_req = acg_queue_pop(g_tlp_ctx)) != NULL) {
 			doca_devemu_pci_tlp_channel_req_complete_acg(
 				acg_req,
 				0,
@@ -4723,7 +4716,7 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 
 	/* Stop TLP context and wait for it to become idle.
 	 * Similar to IO context cleanup, we must drain to IDLE before destroy. */
-	struct doca_ctx *tlp_channel_ctx = vnet_pci_dev_tlp_channel_ctx(resources->tlp_ctx);
+	struct doca_ctx *tlp_channel_ctx = vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx);
 	if (tlp_channel_ctx) {
 		doca_error_t stop_err = doca_ctx_stop(tlp_channel_ctx);
 		if (stop_err == DOCA_ERROR_IN_PROGRESS) {
@@ -4732,7 +4725,7 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 
 			DOCA_LOG_DBG("TLP channel stop in progress - draining to IDLE");
 			do {
-				(void)doca_pe_progress(resources->tlp_ctx->pe);
+				(void)doca_pe_progress(g_tlp_ctx->pe);
 				stop_err = doca_ctx_get_state(tlp_channel_ctx, &ctx_state);
 				if (stop_err != DOCA_SUCCESS)
 					break;
@@ -4751,10 +4744,10 @@ static void cleanup_virtio_network_device(struct vnet_pci_dev_resources *resourc
 	}
 
 	/* Destroy TLP channel (context is now idle) */
-	vnet_pci_dev_stop(resources->tlp_ctx);
+	vnet_pci_dev_stop(g_tlp_ctx);
 
 	/* Reset vnet_pci_dev (destroys PCI type) */
-	vnet_pci_dev_reset(resources->tlp_ctx);
+	vnet_pci_dev_reset(g_tlp_ctx);
 
 	/* Close global log files - only here during final cleanup */
 	close_stats_log_files();
@@ -5051,10 +5044,9 @@ static void drain_msi_retries(struct tlp_context *tlp_ctx)
  * Main thread only drives PE1 for TLP handling. Worker thread drives PE2
  * independently, so no cross-thread PE dependency and no deadlock risk.
  *
- * @resources [in]: Application resources
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
+static doca_error_t run_progress_loop(void)
 {
 	bool shutdown_wait_logged = false;
 	bool shutdown_wait_started = false;
@@ -5063,11 +5055,11 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 	vnet_pci_device_pin_main_thread();
 	DOCA_LOG_INFO("VNet device ready - waiting for host PCIe enumeration...");
 	DOCA_LOG_INFO("Dual PE architecture: PE1=TLP handling (main), PE2=heavy ops (worker)");
-	pci_cfg_workqueue_set_diag_collection(resources->tlp_ctx, true);
+	pci_cfg_workqueue_set_diag_collection(g_tlp_ctx, true);
 
 	while (true) {
-		bool quit_requested = *(resources->force_quit);
-		bool pending_hot_unplug = tlp_ctx_has_pending_unplug(resources->tlp_ctx);
+		bool quit_requested = force_quit;
+		bool pending_hot_unplug = tlp_ctx_has_pending_unplug(g_tlp_ctx);
 
 		if (quit_requested && !pending_hot_unplug)
 			break;
@@ -5080,13 +5072,13 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 
 		/* Drive main PE (PE1) for TLP handling - no synchronization needed
 		 * Worker thread drives PE2 independently for heavy operations */
-		(void)doca_pe_progress(resources->tlp_ctx->pe);
+		(void)doca_pe_progress(g_tlp_ctx->pe);
 
 		/* Retry any slot-event MSIs that were dropped due to ACG credit
 		 * exhaustion. Done right after PE progress so credits replenished
 		 * via the ACG callback are visible here. Keeps the host in sync
 		 * with plug/unplug events without relying on Slot Status polling. */
-		drain_msi_retries(resources->tlp_ctx);
+		drain_msi_retries(g_tlp_ctx);
 
 		/* Diagnostics are collected on the worker thread only.
 		 * Keeping PE1 dedicated to TLP progress avoids completion latency spikes
@@ -5096,7 +5088,7 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 		 * for longer than UNPLUG_TIMEOUT_SEC without host writing Power OFF,
 		 * force-complete the unplug from the DPU side. This handles the case
 		 * where the host driver enters FAILED state and never powers off the slot. */
-		if (resources->tlp_ctx->hotplug_mode) {
+		if (g_tlp_ctx->hotplug_mode) {
 			struct timespec now;
 			static bool clock_warned;
 			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -5106,9 +5098,9 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 				}
 				goto skip_timeout_check;
 			}
-			for (uint32_t i = 0; i < resources->tlp_ctx->num_ep; i++) {
+			for (uint32_t i = 0; i < g_tlp_ctx->num_ep; i++) {
 				struct pci_device_config *ep =
-					&resources->tlp_ctx->devs_config[FIRST_PF_IDX(resources->tlp_ctx) + i];
+					&g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + i];
 				if (!atomic_load(&ep->pending_unplug) || atomic_load(&ep->pending_destroy))
 					continue;
 				long elapsed = (now.tv_sec - ep->unplug_start_time.tv_sec);
@@ -5120,19 +5112,19 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 					      elapsed);
 
 				/* Force device_status=0 so host sees RESET if it tries to use the device */
-				struct vnet_pci_device *vdev = &resources->tlp_ctx->virtio_dev[i];
+				struct vnet_pci_device *vdev = &g_tlp_ctx->virtio_dev[i];
 				vnet_pci_dev_force_reset(vnet_pci_device_get_pci_cfg(vdev), vdev);
 
 				/* Clear DLActive on the DSP bridge so host sees link-down */
 				struct pci_device_config *dsp =
-					&resources->tlp_ctx->devs_config[FIRST_DSP_IDX(resources->tlp_ctx) + i];
+					&g_tlp_ctx->devs_config[FIRST_DSP_IDX(g_tlp_ctx) + i];
 				dsp->caps.express.link_status &= ~LINK_STS_DL_ACTIVE;
 
 				/* Clear Presence Detect State so host sees slot empty */
 				dsp->caps.express.slot_status &= ~SLOT_STS_PRESENCE_DETECT_STATE;
 				dsp->caps.express.slot_status |= SLOT_STS_PRESENCE_DETECT_CHANGED;
 
-				pci_cfg_workqueue_submit_delayed_destroy(resources->tlp_ctx, ep);
+				pci_cfg_workqueue_submit_delayed_destroy(g_tlp_ctx, ep);
 				if (atomic_load(&ep->pending_destroy)) {
 					/* Enqueue succeeded - reset timer for retry backoff if destroy fails */
 					ep->unplug_start_time = now;
@@ -5146,8 +5138,8 @@ static doca_error_t run_progress_loop(struct vnet_pci_dev_resources *resources)
 skip_timeout_check:;
 		}
 
-		quit_requested = *(resources->force_quit);
-		pending_hot_unplug = tlp_ctx_has_pending_unplug(resources->tlp_ctx);
+		quit_requested = force_quit;
+		pending_hot_unplug = tlp_ctx_has_pending_unplug(g_tlp_ctx);
 
 		if (quit_requested && pending_hot_unplug) {
 			struct timespec now;
@@ -5185,19 +5177,19 @@ skip_timeout_check:;
 		 * Speed commands are always available; hotplug requires hotplug_mode. */
 		if (!quit_requested && stdin_has_input()) {
 			struct cli_command cmd;
-			doca_error_t ret = read_cli_command(resources->tlp_ctx->num_ep, &cmd);
+			doca_error_t ret = read_cli_command(g_tlp_ctx->num_ep, &cmd);
 			if (ret == DOCA_SUCCESS) {
 				switch (cmd.type) {
 				case CLI_CMD_PLUG:
 				case CLI_CMD_UNPLUG:
-					if (!resources->tlp_ctx->hotplug_mode) {
+					if (!g_tlp_ctx->hotplug_mode) {
 						DOCA_LOG_ERR("Hotplug commands require --hotplug mode");
 						break;
 					}
 					DOCA_LOG_INFO("%s on DSP[%u] (queuing to worker thread)",
 						      cmd.type == CLI_CMD_PLUG ? "PLUG" : "UNPLUG",
 						      cmd.ep_index);
-					pci_cfg_workqueue_submit_hotplug(resources->tlp_ctx,
+					pci_cfg_workqueue_submit_hotplug(g_tlp_ctx,
 									 cmd.ep_index,
 									 cmd.type == CLI_CMD_PLUG);
 					break;
@@ -5206,7 +5198,7 @@ skip_timeout_check:;
 						      cmd.ep_index,
 						      cmd.speed);
 					pci_cfg_workqueue_submit_speed_change(
-						&resources->tlp_ctx->vnet_controller[cmd.ep_index],
+						&g_tlp_ctx->vnet_controller[cmd.ep_index],
 						cmd.speed);
 					break;
 				}
@@ -5214,7 +5206,7 @@ skip_timeout_check:;
 		}
 	}
 
-	pci_cfg_workqueue_set_diag_collection(resources->tlp_ctx, false);
+	pci_cfg_workqueue_set_diag_collection(g_tlp_ctx, false);
 	DOCA_LOG_INFO("Exiting progress loop...");
 	return DOCA_SUCCESS;
 }
@@ -5224,7 +5216,7 @@ skip_timeout_check:;
  * (export receive, config apply, primary takeover), initialize ACG queue,
  * close the UDS connection, and transition to chainable-active mode.
  */
-static void vnet_lu_standby_post_restore(struct vnet_pci_dev_config *config, struct vnet_pci_dev_resources *resources)
+static void vnet_lu_standby_post_restore(void)
 {
 	doca_error_t result;
 
@@ -5234,13 +5226,13 @@ static void vnet_lu_standby_post_restore(struct vnet_pci_dev_config *config, str
 		goto transition;
 	}
 
-	result = vnet_lu_channel_restore(resources);
+	result = vnet_lu_channel_restore();
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_WARN("Channel LU restore failed: %s", doca_error_get_descr(result));
 		goto transition;
 	}
 
-	result = init_acg_queue(resources->tlp_ctx);
+	result = init_acg_queue(g_tlp_ctx);
 	if (result != DOCA_SUCCESS)
 		DOCA_LOG_WARN("Channel LU: ACG queue init failed: %s", doca_error_get_descr(result));
 
@@ -5248,38 +5240,34 @@ transition:
 	vnet_lu_close_conn();
 
 	DOCA_LOG_INFO("Transitioning from standby to active mode (chainable LU)");
-	config->vnet_lu_mode = VNET_LU_MODE_ACTIVE;
+	g_config.vnet_lu_mode = VNET_LU_MODE_ACTIVE;
 	result = vnet_lu_active_init();
 	if (result != DOCA_SUCCESS) {
-		config->vnet_lu_mode = VNET_LU_MODE_NONE;
+		g_config.vnet_lu_mode = VNET_LU_MODE_NONE;
 		DOCA_LOG_WARN("Failed to init active mode after restore: %s", doca_error_get_descr(result));
 	}
 	DOCA_LOG_INFO("LU restore complete -- process is active (pid=%d)", getpid());
 }
 
-doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool *force_quit)
+doca_error_t vnet_pci_dev_run(void)
 {
-	struct vnet_pci_dev_resources resources = {0};
 	doca_error_t result = DOCA_SUCCESS;
 	uint8_t mac_bytes[ETH_ALEN];
 
 	DOCA_LOG_INFO("Initializing VNet device: 1 USP + %u DSPs + %u EPs (%s mode)",
-		      config->num_ep,
-		      config->num_ep,
-		      config->hotplug_mode ? "Hotplug" : "Static");
-
-	/* Store force quit reference */
-	resources.force_quit = force_quit;
+		      g_config.num_ep,
+		      g_config.num_ep,
+		      g_config.hotplug_mode ? "Hotplug" : "Static");
 
 	/* Initialize TLP context - allocate memory */
-	result = init_tlp_context(&resources.tlp_ctx, config->num_ep, config->hotplug_mode);
+	result = init_tlp_context(&g_tlp_ctx, g_config.num_ep, g_config.hotplug_mode);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize TLP context: %s", doca_error_get_descr(result));
 		return result;
 	}
 
 	/* Parse MAC address */
-	result = parse_mac_address(config->mac_addr, mac_bytes);
+	result = parse_mac_address(g_config.mac_addr, mac_bytes);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to parse MAC address: %s", doca_error_get_descr(result));
 		goto error;
@@ -5287,15 +5275,15 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 
 	/* === LU Phase 1 (pre-copy): App_A still serving traffic.
 	 * Receive cmd_fd + SHM, reconstruct device, run heavyweight init. === */
-	if (vnet_lu_is_standby(config->vnet_lu_mode)) {
-		result = vnet_lu_restore_early(&resources);
+	if (vnet_lu_is_standby(g_config.vnet_lu_mode)) {
+		result = vnet_lu_restore_early();
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to restore from active: %s", doca_error_get_descr(result));
 			goto error;
 		}
-		vnet_lu_override_config(config, resources.tlp_ctx, mac_bytes);
+		vnet_lu_override_config(mac_bytes);
 	} else {
-		result = find_doca_device(config->pci_address, config->ibdev_name, &resources.tlp_ctx->dev);
+		result = find_doca_device(g_config.pci_address, g_config.ibdev_name, &g_tlp_ctx->dev);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to find DOCA device: %s", doca_error_get_descr(result));
 			goto error;
@@ -5303,16 +5291,16 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 	}
 
 	/* Initialize main progress engine (PE1) for TLP handling */
-	result = init_progress_engine(resources.tlp_ctx);
+	result = init_progress_engine(g_tlp_ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize progress engine: %s", doca_error_get_descr(result));
 		goto error;
 	}
 
-	vnet_pci_device_configure_affinity(config->tlp_core_idx, config->worker_core_idx, config->mq_core_idx);
+	vnet_pci_device_configure_affinity(g_config.tlp_core_idx, g_config.worker_core_idx, g_config.mq_core_idx);
 
 	/* Initialize VirtIO network device (this also initializes workqueue and controllers) */
-	result = init_virtio_network_device(&resources, config, mac_bytes);
+	result = init_virtio_network_device(mac_bytes);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to initialize VirtIO network device: %s", doca_error_get_descr(result));
 		goto cleanup_pe;
@@ -5322,8 +5310,8 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 	 * Must be done AFTER init_virtio_network_device which initializes controllers.
 	 * Each controller gets its own worker PE for heavy operations like
 	 * IO context cleanup, VQ lifecycle, etc. */
-	for (uint32_t i = 0; i < config->num_ep; i++) {
-		struct vnet_pci_dev_controller *ctrl = &resources.tlp_ctx->vnet_controller[i];
+	for (uint32_t i = 0; i < g_config.num_ep; i++) {
+		struct vnet_pci_dev_controller *ctrl = &g_tlp_ctx->vnet_controller[i];
 		result = doca_pe_create(&ctrl->worker_pe);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to create worker PE for controller %u: %s",
@@ -5331,20 +5319,20 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 				     doca_error_get_descr(result));
 			/* Cleanup already created worker PEs */
 			for (uint32_t j = 0; j < i; j++) {
-				if (resources.tlp_ctx->vnet_controller[j].worker_pe) {
-					doca_pe_destroy(resources.tlp_ctx->vnet_controller[j].worker_pe);
-					resources.tlp_ctx->vnet_controller[j].worker_pe = NULL;
+				if (g_tlp_ctx->vnet_controller[j].worker_pe) {
+					doca_pe_destroy(g_tlp_ctx->vnet_controller[j].worker_pe);
+					g_tlp_ctx->vnet_controller[j].worker_pe = NULL;
 				}
 			}
 			goto cleanup_virtio;
 		}
 		DOCA_LOG_DBG("Worker PE (PE2) created for controller %u", i);
 	}
-	DOCA_LOG_INFO("Worker progress engines (PE2) initialized for %u controllers", config->num_ep);
+	DOCA_LOG_INFO("Worker progress engines (PE2) initialized for %u controllers", g_config.num_ep);
 
-	if (vnet_lu_is_standby(config->vnet_lu_mode)) {
+	if (vnet_lu_is_standby(g_config.vnet_lu_mode)) {
 		/* Phase 1 replay: everything except oe_enable. */
-		result = vnet_lu_apply_shm_replay(&resources, config);
+		result = vnet_lu_apply_shm_replay();
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("LU phase1 replay failed: %s", doca_error_get_descr(result));
 			goto cleanup_virtio;
@@ -5357,7 +5345,7 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 		}
 
 		/* Phase 2: parallel per-device enable (one thread per 'G'). */
-		result = vnet_lu_phase2_enable_engines(&resources);
+		result = vnet_lu_phase2_enable_engines();
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("LU phase2 enable failed: %s", doca_error_get_descr(result));
 			goto cleanup_virtio;
@@ -5370,22 +5358,22 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 	 * to avoid stalling controllers 1..N. */
 	{
 		struct doca_pe *worker_pes[MAX_NUM_EP];
-		for (uint32_t j = 0; j < config->num_ep; j++)
-			worker_pes[j] = resources.tlp_ctx->vnet_controller[j].worker_pe;
-		pci_cfg_workqueue_set_worker_pes(worker_pes, config->num_ep);
+		for (uint32_t j = 0; j < g_config.num_ep; j++)
+			worker_pes[j] = g_tlp_ctx->vnet_controller[j].worker_pe;
+		pci_cfg_workqueue_set_worker_pes(worker_pes, g_config.num_ep);
 	}
 
 	/* LU standby: stats creation is async, requires workqueue PEs. */
-	if (vnet_lu_is_standby(config->vnet_lu_mode)) {
-		for (uint32_t i = 0; i < config->num_ep; i++)
-			pci_cfg_workqueue_submit_create_stats_list(&resources.tlp_ctx->vnet_controller[i]);
+	if (vnet_lu_is_standby(g_config.vnet_lu_mode)) {
+		for (uint32_t i = 0; i < g_config.num_ep; i++)
+			pci_cfg_workqueue_submit_create_stats_list(&g_tlp_ctx->vnet_controller[i]);
 	}
 
 	DOCA_LOG_INFO("VNet device initialized successfully");
-	DOCA_LOG_DBG("  MAC=%s, MTU=%u", config->mac_addr, config->mtu);
+	DOCA_LOG_DBG("  MAC=%s, MTU=%u", g_config.mac_addr, g_config.mtu);
 
 	/* ACTIVE: init now. STANDBY defers to post-restore below. */
-	if (config->vnet_lu_mode == VNET_LU_MODE_ACTIVE) {
+	if (g_config.vnet_lu_mode == VNET_LU_MODE_ACTIVE) {
 		result = vnet_lu_active_init();
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to initialize active mode: %s", doca_error_get_descr(result));
@@ -5393,24 +5381,24 @@ doca_error_t vnet_pci_dev_run(struct vnet_pci_dev_config *config, volatile bool 
 		}
 	}
 
-	if (config->hotplug_mode) {
+	if (g_config.hotplug_mode) {
 		DOCA_LOG_INFO("Hotplug control (enter commands):");
 		DOCA_LOG_INFO("  plug <DSP_IDX>   - Plug device to DSP slot");
 		DOCA_LOG_INFO("  unplug <DSP_IDX> - Unplug device from DSP slot");
 		DOCA_LOG_INFO("Example: plug 0");
 	}
 
-	if (vnet_lu_is_standby(config->vnet_lu_mode))
-		vnet_lu_standby_post_restore(config, &resources);
+	if (vnet_lu_is_standby(g_config.vnet_lu_mode))
+		vnet_lu_standby_post_restore();
 
 	/* Run progress loop */
-	result = run_progress_loop(&resources);
+	result = run_progress_loop();
 
 	/* Active post-loop: execute handover (if SIGUSR1) + cleanup. */
-	if (vnet_lu_is_enabled(config->vnet_lu_mode)) {
-		if (vnet_lu_active_post_loop(&resources)) {
+	if (vnet_lu_is_enabled(g_config.vnet_lu_mode)) {
+		if (vnet_lu_active_post_loop()) {
 			DOCA_LOG_INFO("LU handover complete -- process is idle (pid=%d), Ctrl+C to exit", getpid());
-			while (!*resources.force_quit)
+			while (!force_quit)
 				sleep(1);
 		}
 	}
@@ -5421,23 +5409,24 @@ cleanup_virtio:
 	 * cleanup_virtio_network_device() calls pci_cfg_workqueue_shutdown() which
 	 * joins the worker thread. Worker thread may be progressing PEs, so we
 	 * must wait for it to exit before destroying the PEs it's using. */
-	cleanup_virtio_network_device(&resources);
+	cleanup_virtio_network_device();
 
 	/* Now safe to destroy worker PEs - worker thread has exited */
 	pci_cfg_workqueue_clear_worker_pes();
-	for (uint32_t i = 0; i < config->num_ep; i++) {
-		if (resources.tlp_ctx->vnet_controller[i].worker_pe) {
-			doca_pe_destroy(resources.tlp_ctx->vnet_controller[i].worker_pe);
-			resources.tlp_ctx->vnet_controller[i].worker_pe = NULL;
+	for (uint32_t i = 0; i < g_config.num_ep; i++) {
+		if (g_tlp_ctx->vnet_controller[i].worker_pe) {
+			doca_pe_destroy(g_tlp_ctx->vnet_controller[i].worker_pe);
+			g_tlp_ctx->vnet_controller[i].worker_pe = NULL;
 		}
 	}
 	DOCA_LOG_INFO("Worker progress engines cleaned up");
 
 cleanup_pe:
-	cleanup_progress_engine(resources.tlp_ctx);
+	cleanup_progress_engine(g_tlp_ctx);
 
 error:
-	tlp_ctx_cleanup(resources.tlp_ctx);
+	tlp_ctx_cleanup(g_tlp_ctx);
+	g_tlp_ctx = NULL;
 
 	/* Live update standby cleanup is idempotent when no restore was done. */
 	vnet_lu_close_conn();
