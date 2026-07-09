@@ -121,208 +121,430 @@ doca_devemu_pci_msix_destroy();
 ### 3.2 代码级主线
 
 ```text
-main()
-  -> 初始化日志
-  -> doca_argp 解析 PCI/IB device、MAC、MTU、speed、queue pair、queue size、EP 数量等参数
-  -> 注册 SIGINT/SIGTERM
-  -> vnet_pci_dev_run()
+# 标注说明：
+# [PCI设备模拟]：创建/维护 Host 可枚举的 PCI bridge、endpoint、配置空间、BAR、TLP channel、hotplug/MSI。
+# [Doorbell/DMA通道]：创建 VNet/virtio offload engine、doorbell/VQ/CVQ/IO context，
+#                    绑定 Host 写入的 virtqueue 地址并启用收发 Host 内存的 DMA 数据面。
 
 vnet_pci_dev_run()
-  -> init_tlp_context()
-  -> parse_mac_address()
-  -> open DOCA device
-  -> doca_pe_create(PE1)
-  -> init_virtio_network_device()
-  -> 为每个 controller 创建 worker PE(PE2)
-  -> pci_cfg_workqueue_set_worker_pes()
+  -> init_tlp_context(&g_tlp_ctx, g_config.num_ep, g_config.hotplug_mode)
+      -> calloc(tlp_context)
+      -> pthread_mutex_init(acg_queue_lock)
+      -> calloc(devs_config)             // 1 USP + N DSP + N EP + dummy, N = g_config.num_ep
+      -> pthread_rwlock_init(endpoint_lock)
+      -> calloc(bdf_entries)
+      -> calloc(virtio_dev)
+      -> calloc(vnet_controller)
+      -> pthread_mutex_init(stats_ref_mutex)
+
+  -> parse_mac_address(g_config.mac_addr, mac_bytes)
+      -> 纯软件解析，无 DOCA API
+
+  -> find_doca_device(g_config.pci_address, g_config.ibdev_name, &g_tlp_ctx->dev)
+      -> open_doca_device_with_ibdev_name((const uint8_t *)g_config.ibdev_name,
+                                          strlen(g_config.ibdev_name), NULL, &g_tlp_ctx->dev)
+         // g_config.ibdev_name 非空时优先使用
+      或 open_doca_device_with_pci(g_config.pci_address, NULL, &g_tlp_ctx->dev)
+         // g_config.ibdev_name 为空时使用
+
+  -> init_progress_engine(g_tlp_ctx)
+      -> doca_pe_create(&g_tlp_ctx->pe)  // PE1: 主线程 TLP 快路径
+
+  -> vnet_pci_device_configure_affinity(g_config.tlp_core_idx,
+                                        g_config.worker_core_idx,
+                                        g_config.mq_core_idx)
+
+  // [PCI设备模拟] 创建 PCI DevEmu type、TLP channel、虚拟拓扑和 virtio-net 配置空间；
+  // [Doorbell/DMA通道] 同一初始化阶段也创建 VNet 子系统和 endpoint 对应的 offload engine。
+  -> init_virtio_network_device(mac_bytes)
+      // [PCI设备模拟] 初始化 PCI type/workqueue 框架。
+      -> vnet_pci_dev_init(g_tlp_ctx)
+          // [PCI设备模拟] 声明 virtio-net PCI TLP type、MSI-X capability，并启动 PCI type。
+          -> vnet_pci_device_init(g_tlp_ctx)
+              -> doca_dev_as_devinfo(g_tlp_ctx->dev)
+              -> doca_devemu_vnet_cap_is_pci_tlp_type_supported(devinfo, &supported)
+              -> doca_devemu_vnet_pci_tlp_type_create("vnet_pci_dev", &g_tlp_ctx->pci_type)
+              -> doca_devemu_pci_type_set_dev(g_tlp_ctx->pci_type, g_tlp_ctx->dev)
+              -> doca_devemu_pci_type_set_num_msix(g_tlp_ctx->pci_type, VNET_PCI_DEV_NUM_MSIX)
+              // [Doorbell/DMA通道] 向 PCI type 声明 doorbell register 数量，供 Host notify/VQ 通知使用。
+              -> doca_devemu_pci_type_set_num_db(g_tlp_ctx->pci_type, VNET_PCI_DEV_NUM_DB)
+              -> doca_devemu_pci_tlp_type_set_pci_cap_conf(g_tlp_ctx->pci_type,
+                                                           PCI_CAP_ID_MSIX,
+                                                           offsetof(struct pcie_virtio_dev, cfg.msix_cap),
+                                                           sizeof(struct msix_capability))
+              -> doca_devemu_pci_type_start(g_tlp_ctx->pci_type)
+              -> doca_devemu_pci_type_create_bar_info_list(g_tlp_ctx->pci_type, &bar_list, &n)
+              -> doca_devemu_pci_bar_info_get_bar_id(bar_list[i], &id)
+              -> doca_devemu_pci_bar_info_get_log_sz(bar_list[i], &log_sz)
+              -> doca_devemu_pci_bar_info_get_mem_type(bar_list[i], &mem_type)
+              -> doca_devemu_pci_bar_info_get_prefetchable(bar_list[i], &is_prefetch)
+              -> doca_devemu_pci_type_destroy_bar_info_list(bar_list)
+              -> doca_devemu_pci_type_create_transaction_region_info_list(g_tlp_ctx->pci_type,
+                                                                          &mmio_list, &n)
+              -> doca_devemu_pci_transaction_region_info_get_bar_id(mmio_list[i], &bar_id)
+              -> doca_devemu_pci_transaction_region_info_get_start_addr(mmio_list[i], &start_addr)
+              -> doca_devemu_pci_transaction_region_info_get_size(mmio_list[i], &size)
+              -> doca_devemu_pci_type_destroy_transaction_region_info_list(mmio_list)
+              // [Doorbell/DMA通道] 查询 firmware 给 virtio-net 预定义的 doorbell region 布局。
+              -> doca_devemu_pci_type_create_db_region_by_data_info_list(g_tlp_ctx->pci_type,
+                                                                         &db_list, &n)
+              -> doca_devemu_pci_db_region_by_data_info_get_bar_id(db_list[i], &bar_id)
+              -> doca_devemu_pci_db_region_by_data_info_get_start_addr(db_list[i], &start_addr)
+              -> doca_devemu_pci_db_region_by_data_info_get_size(db_list[i], &size)
+              -> doca_devemu_pci_type_destroy_db_region_by_data_info_list(db_list)
+              -> doca_devemu_pci_type_create_msix_table_region_info_list(g_tlp_ctx->pci_type,
+                                                                         &msix_list, &n)
+              -> doca_devemu_pci_msix_table_region_info_get_bar_id(msix_list[i], &bar_id)
+              -> doca_devemu_pci_msix_table_region_info_get_start_addr(msix_list[i], &start_addr)
+              -> doca_devemu_pci_msix_table_region_info_get_size(msix_list[i], &size)
+              -> doca_devemu_pci_type_destroy_msix_table_region_info_list(msix_list)
+              -> doca_devemu_pci_type_create_msix_pba_region_info_list(g_tlp_ctx->pci_type,
+                                                                       &pba_list, &n)
+              -> doca_devemu_pci_msix_pba_region_info_get_bar_id(pba_list[i], &bar_id)
+              -> doca_devemu_pci_msix_pba_region_info_get_start_addr(pba_list[i], &start_addr)
+              -> doca_devemu_pci_msix_pba_region_info_get_size(pba_list[i], &size)
+              -> doca_devemu_pci_type_destroy_msix_pba_region_info_list(pba_list)
+
+      // [PCI设备模拟] 创建 TLP channel 并注册 Host config/MMIO/PCI event 请求回调。
+      -> vnet_pci_dev_start(g_tlp_ctx)                 // 非 LU standby
+          -> doca_devemu_pci_tlp_channel_create(g_tlp_ctx->dev, &g_tlp_ctx->tlp_channel)
+          -> doca_devemu_pci_tlp_channel_set_req_user_data_size(g_tlp_ctx->tlp_channel,
+                                                                VNET_TLP_REQ_USER_DATA_SIZE)
+          -> doca_devemu_pci_tlp_channel_event_req_register(g_tlp_ctx->tlp_channel,
+                                                            vnet_pci_dev_event_cb)
+          -> if g_tlp_ctx->hotplug_mode:
+               doca_devemu_pci_tlp_channel_set_acg_enabled(g_tlp_ctx->tlp_channel, 1)
+      -> LU standby only: vnet_pci_dev_start_from_export(g_tlp_ctx, export_desc, export_desc_len,
+                                                         VNET_LU_CH_SHM_DIR)
+          -> doca_devemu_pci_tlp_channel_create_from_export(export_desc, export_desc_len,
+                                                            VNET_LU_CH_SHM_DIR,
+                                                            g_tlp_ctx->dev, &g_tlp_ctx->tlp_channel)
+          -> doca_devemu_pci_tlp_channel_set_primary(g_tlp_ctx->tlp_channel, false)
+          -> doca_devemu_pci_tlp_channel_set_req_user_data_size(g_tlp_ctx->tlp_channel,
+                                                                VNET_TLP_REQ_USER_DATA_SIZE)
+          -> doca_devemu_pci_tlp_channel_event_req_register(g_tlp_ctx->tlp_channel,
+                                                            vnet_pci_dev_event_cb)
+          -> if g_tlp_ctx->hotplug_mode:
+               doca_devemu_pci_tlp_channel_set_acg_enabled(g_tlp_ctx->tlp_channel, true)
+
+      // [PCI设备模拟] 将 TLP channel 接入 PE1，Host 枚举请求由主循环 progress。
+      -> doca_devemu_pci_tlp_channel_as_ctx(g_tlp_ctx->tlp_channel)
+      -> doca_pe_connect_ctx(g_tlp_ctx->pe, vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx))
+      -> doca_ctx_set_user_data(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx),
+                                user_data.ptr = g_tlp_ctx)
+      -> doca_ctx_start(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx))
+      -> doca_devemu_pci_tlp_channel_get_num_dsp(g_tlp_ctx->tlp_channel,
+                                                 &num_nv_switch_tlp_dsp)
+      -> init_acg_queue(g_tlp_ctx)
+          -> doca_dev_as_devinfo(g_tlp_ctx->dev)
+          -> doca_devemu_pci_tlp_cap_get_max_acg(devinfo, &g_tlp_ctx->acg_queue_size)
+
+      -> init_device_topology()
+          -> 纯软件初始化 USP/DSP/EP 配置空间、capability、BDF map 初始状态
+
+      // [Doorbell/DMA通道] 初始化 VNet 子系统，后续 offload engine/VQ/IO context 依赖它。
+      -> vnet_pci_dev_vnet_controller_init()
+          -> doca_devemu_vnet_add_dev(g_tlp_ctx->dev)
+          -> doca_devemu_vnet_init()
+          -> parse_mac_address(g_config.mac_addr, g_tlp_ctx->mac_bytes_base)
+          -> g_tlp_ctx->max_queue_pairs = g_config.max_queue_pairs
+          -> g_tlp_ctx->queue_size = g_config.queue_size
+          -> g_tlp_ctx->mtu = g_config.mtu
+
+      // [PCI设备模拟] 创建 virtio-net 软件设备模型：common cfg、device cfg、feature、queue shadow。
+      -> vnet_pci_device_create(g_tlp_ctx, &attr)
+          -> 为每个 EP 初始化 virtio-net 软件设备模型
+          -> attr.num_queues = g_config.max_queue_pairs * 2 + 1
+          -> attr.queue_size = g_config.queue_size
+          -> attr.dev_cfg = &net_cfg                 // MAC=mac_bytes, mtu/speed/duplex 来自 g_config
+          -> attr.device_features = VNET_PCI_DEV_DEFAULT_FEATURES
+          -> attr.pci_cfg_change_cb = virtio_net_ctrl_change_cb
+          -> attr.cb_arg = g_tlp_ctx
+
+      // [PCI设备模拟] static mode 下为每个 EP 创建 Host 可枚举的 representor/TLP device。
+      -> static mode: create_all_devices()
+          -> for each EP:
+              -> create_device(g_tlp_ctx,
+                               &g_tlp_ctx->devs_config[FIRST_PF_IDX(g_tlp_ctx) + i],
+                               ep_vhca_id = 0 或 LU 恢复值)
+              -> 更新 DSP slot 为 Power ON / PDS=1 / DLActive=1
+
+      -> init_transaction_region(g_tlp_ctx, TRANSACTION_REGION_SIZE)
+          -> malloc() 每个 PF 的 transaction region backing memory
+
+  // [Doorbell/DMA通道] 每个 controller 创建 PE2，承载 VQ/IO/stat 等数据面重操作。
+  -> for each controller:
+      -> doca_pe_create(&g_tlp_ctx->vnet_controller[i].worker_pe)  // PE2: VQ/IO/stat 等重操作
+
+  -> pci_cfg_workqueue_set_worker_pes(worker_pes, g_config.num_ep)
+
   -> run_progress_loop()
+      -> vnet_pci_device_pin_main_thread()
+      -> pci_cfg_workqueue_set_diag_collection(g_tlp_ctx, true)
+      -> while !force_quit:
+          // [PCI设备模拟] Host 启动后通过 TLP channel 发起 config read/write、MMIO read/write、PCI event。
+          //              vnet_pci_device.c 中的 TLP callback 维护 bridge/endpoint 配置空间、
+          //              BAR、BDF map、virtio common config，并完成对应 TLP 请求。
+          -> doca_pe_progress(g_tlp_ctx->pe)
+              -> vnet_pci_dev_event_cb(channel, tlp_req, req_user_data)
+                  // channel/tlp_req 由 DOCA 回调传入；g_tlp_ctx 从 channel ctx user_data 取回
+                  -> doca_devemu_pci_tlp_channel_as_ctx(channel)
+                  -> doca_ctx_get_user_data(doca_devemu_pci_tlp_channel_as_ctx(channel),
+                                            &channel_user_data)
+                  -> doca_devemu_pci_tlp_channel_req_get_opcode(tlp_req)
+                  -> doca_devemu_pci_tlp_channel_req_get_tlp_header(tlp_req)
+                  -> doca_devemu_pci_tlp_channel_req_get_tlp_data(tlp_req)
+                  -> doca_devemu_pci_tlp_channel_req_get_tlp_cpl_header(tlp_req)
+                  -> doca_devemu_pci_tlp_channel_req_get_tlp_cpl_data(tlp_req)
+                  -> if opcode == ACG and queue full:
+                       doca_devemu_pci_tlp_channel_req_complete_acg(
+                         tlp_req, 0, DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_ACG_COMP_OPMODE_FLUSH)
+                  // [PCI设备模拟] 完成 Host 枚举/配置空间访问和 PCI event。
+                  -> doca_devemu_pci_tlp_channel_req_complete_config_read(
+                         tlp_req, dev_cfg->tlp_dev, is_cap_id_valid, cap_id, is_pcie_cap)
+                  -> doca_devemu_pci_tlp_channel_req_complete_config_write(
+                         tlp_req, dev_cfg->tlp_dev, is_cap_id_valid, cap_id, is_pcie_cap)
+                  -> doca_devemu_pci_tlp_channel_req_complete_tlp(tlp_req, is_non_posted,
+                                                                  dev_cfg->tlp_dev 或 NULL)
+                  -> doca_devemu_pci_tlp_channel_req_complete_pci_event(tlp_req)
+          // [PCI设备模拟] hotplug MSI 通过 ACG credit 构造 Memory Write TLP 通知 Host。
+          -> drain_msi_retries()
+              -> send_msi_via_memory_write_tlp(g_tlp_ctx, dsp)
+                  -> acg_queue_pop(g_tlp_ctx)          // 返回缓存的 acg_req
+                  -> doca_devemu_pci_tlp_channel_req_get_acg_buf(acg_req)
+                  -> doca_devemu_pci_tlp_channel_req_complete_acg(
+                         acg_req, tlp_size,
+                         DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_ACG_COMP_OPMODE_MMIO_WRITE)
+          -> stdin hotplug/speed command
+              -> pci_cfg_workqueue_submit_hotplug(g_tlp_ctx, cmd.ep_index, plug)
+                 -> create_device(g_tlp_ctx, endpoint, 0) 或延迟 vnet_pci_dev_destroy_device()
+                 -> send_msi_via_memory_write_tlp(g_tlp_ctx, dsp)
+              或 pci_cfg_workqueue_submit_speed_change(&g_tlp_ctx->vnet_controller[cmd.ep_index],
+                                                       cmd.speed)
+                 // [PCI设备模拟] 使用 Host 分配的 MSI-X vector 发送配置变更中断。
+                 -> doca_devemu_pci_tlp_dev_as_ep(endpoint->tlp_dev)
+                 -> if vector changed:
+                      doca_devemu_pci_msix_destroy(controller->config_msix)
+                 -> doca_devemu_pci_ep_create_msix(pci_ep, VNET_VIRTIO_BAR_ID,
+                                                   VNET_VIRTIO_MSIX_TABLE_OFFSET,
+                                                   live_vector, &controller->config_msix)
+                 -> doca_devemu_pci_msix_raise(controller->config_msix)
+      -> pci_cfg_workqueue_set_diag_collection(g_tlp_ctx, false)
+
   -> cleanup_virtio_network_device()
-  -> 销毁 worker PE、PE1、TLP context
+      -> pci_cfg_workqueue_shutdown()
+      -> for each virtio_dev:
+          -> vnet_pci_device_destroy(&g_tlp_ctx->virtio_dev[i])
+      -> for each EP:
+          -> vnet_pci_dev_destroy_device(g_tlp_ctx, ep)       // 重复调用，见下方独立展开
+      // [Doorbell/DMA通道] 关闭 VNet 子系统和 offload engine 相关资源。
+      -> vnet_pci_dev_vnet_controller_uninit()
+          -> doca_devemu_vnet_teardown()
+          -> doca_devemu_vnet_rm_dev(g_tlp_ctx->dev)
+      // [PCI设备模拟] flush ACG、停止 TLP channel、销毁 PCI type。
+      -> flush ACG credits
+          -> doca_devemu_pci_tlp_channel_req_complete_acg(
+                 acg_req, 0, DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_ACG_COMP_OPMODE_FLUSH)
+      -> doca_ctx_stop(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx))
+      -> while ctx not IDLE:
+          -> doca_pe_progress(g_tlp_ctx->pe)
+          -> doca_ctx_get_state(vnet_pci_dev_tlp_channel_ctx(g_tlp_ctx), &ctx_state)
+      -> vnet_pci_dev_stop(g_tlp_ctx)
+          -> doca_devemu_pci_tlp_channel_destroy(g_tlp_ctx->tlp_channel)
+      -> vnet_pci_dev_reset(g_tlp_ctx)
+          -> doca_devemu_pci_type_stop(g_tlp_ctx->pci_type)
+          -> doca_devemu_pci_type_destroy(g_tlp_ctx->pci_type)
 
-init_virtio_network_device()
-  -> vnet_pci_dev_init()
-  -> vnet_pci_dev_start() 创建 TLP channel
-  -> doca_pe_connect_ctx(PE1, TLP channel ctx)
-  -> doca_ctx_start(TLP channel ctx)
-  -> init_device_topology()
-  -> doca_devemu_vnet_add_dev()
-  -> doca_devemu_vnet_init()
-  -> vnet_pci_device_create() 建立 virtio-net 配置模型
-  -> static mode 下 create_all_devices()
-  -> init_transaction_region()
-
-create_device()
-  -> doca_devemu_pci_type_create_rep()
-  -> doca_devemu_pci_tlp_dev_create()
-  -> doca_devemu_pci_tlp_dev_start()
-  -> vnet_pci_dev_vnet_controller_create()
-
-vnet_pci_dev_vnet_controller_create()
-  -> doca_devemu_vnet_offload_engine_create()
-  -> doca_devemu_virtio_offload_engine_set_shm_dir_path()
-  -> doca_devemu_vnet_offload_engine_set_mtu()
-  -> doca_devemu_vnet_offload_engine_set_mac()
-  -> doca_devemu_virtio_offload_engine_set_num_queues()
-  -> 分配 RX/TX VQ 指针数组
+  -> pci_cfg_workqueue_clear_worker_pes()
+  -> for each controller:
+      -> doca_pe_destroy(g_tlp_ctx->vnet_controller[i].worker_pe)
+  -> cleanup_progress_engine(g_tlp_ctx)
+      -> doca_pe_destroy(g_tlp_ctx->pe)
+  -> tlp_ctx_cleanup(g_tlp_ctx)
+      -> doca_dev_close(g_tlp_ctx->dev)
+      -> free software objects
 ```
 
-### 3.2 Host 枚举与 VirtIO 状态回调
+重复调用的 endpoint/controller 函数单独展开如下，避免在每个 EP 下重复列出：
 
-Host 启动后通过 TLP channel 发起 config read/write、MMIO read/write、PCI event。`vnet_pci_device.c` 中的
-TLP callback 负责维护 bridge/endpoint 配置空间、BAR、BDF map、virtio common config 等软件状态，并用
-`doca_devemu_pci_tlp_channel_req_complete_*()` 完成请求。
+```text
+create_device(tlp_ctx == g_tlp_ctx, endpoint)
+  // [PCI设备模拟] 为一个 endpoint 创建 Host 侧可见的 representor + TLP device。
+  -> doca_devemu_pci_type_create_rep(g_tlp_ctx->pci_type, &endpoint->rep)
+     或 LU standby: vnet_lu_find_existing_rep(g_tlp_ctx->pci_type, lu_ep_vhca_id, &endpoint->rep)
+  -> doca_dev_rep_as_devinfo(endpoint->rep)
+  -> doca_devinfo_rep_get_vhca_id(devinfo_rep, &vhca_id)
+  -> doca_devemu_pci_tlp_dev_create(g_tlp_ctx->pci_type, endpoint->rep, &endpoint->tlp_dev)
+  -> doca_devemu_pci_tlp_dev_start(endpoint->tlp_dev)
+  // [Doorbell/DMA通道] endpoint 存在后，为该 PCI EP 创建 VNet offload engine。
+  -> vnet_pci_dev_vnet_controller_create(g_tlp_ctx, endpoint)
 
-VirtIO 状态变化由 `virtio_net_ctrl_change_cb()` 处理：
+vnet_pci_dev_vnet_controller_create(tlp_ctx == g_tlp_ctx, endpoint)
+  -> get_pf_index_for_device(g_tlp_ctx, endpoint, &pf_index)  // pf_index 决定 controller[i]
+  -> controller = &g_tlp_ctx->vnet_controller[pf_index]
+  // [Doorbell/DMA通道] 以 PCI endpoint 为锚点创建/恢复 offload engine。
+  -> doca_devemu_pci_tlp_dev_as_ep(endpoint->tlp_dev)
+  -> doca_devemu_vnet_offload_engine_create(pci_ep, &controller->offload_engine)
+     或 LU standby: doca_devemu_vnet_offload_engine_create_from_export(
+           import_desc, import_desc_len, VNET_LU_OE_SHM_DIR, pci_ep, &controller->offload_engine)
+  -> doca_devemu_vnet_offload_engine_as_virtio_offload(controller->offload_engine)
+  -> doca_devemu_virtio_offload_engine_set_shm_dir_path(virtio_engine, VNET_LU_OE_SHM_DIR)
+  -> doca_devemu_vnet_offload_engine_set_mtu(controller->offload_engine,
+                                             g_tlp_ctx->mtu /* 来自 g_config.mtu */)
+  -> doca_devemu_vnet_offload_engine_set_mac(controller->offload_engine,
+                                             mac_bytes = g_tlp_ctx->mac_bytes_base, mac_bytes[5] += pf_index)
+  -> doca_devemu_virtio_offload_engine_set_num_queues(
+         virtio_engine, total_vqs = g_tlp_ctx->max_queue_pairs * 2 + 1)
+  -> doca_devemu_vnet_offload_engine_get_rep(controller->offload_engine, &rep)
+  -> doca_dev_rep_as_devinfo(rep)
+  -> doca_devinfo_rep_get_vhca_id(devinfo_rep, &vhca_id)
+  -> doca_devinfo_rep_get_iface_index(devinfo_rep, &ifindex)
+  -> doca_devinfo_rep_get_pci_func_type(devinfo_rep, &pci_func_type)
+  -> doca_devinfo_rep_get_sf_index(devinfo_rep, &sf_index)     // 仅 SF 类型
+  -> calloc(rx_vqs)
+  -> calloc(tx_vqs)
 
-```c
-/* Host 写 FEATURES_OK：准备硬件，但不阻塞 TLP 主线程 */
-on_features_ok(dev):
-    ctrl = controller_for(dev);
+Host 写 FEATURES_OK 后的异步硬件准备路径：
+  // [Doorbell/DMA通道] virtio_net_ctrl_change_cb() 处理 VirtIO 状态变化。
+  //                  Host 写 FEATURES_OK 后，feature 已协商完成；这里开始准备 engine、
+  //                  RX/TX VQ、CVQ 和 IO context，但不阻塞 TLP 主线程。
+  -> virtio_net_ctrl_change_cb(dev, prev_status, pci_cfg->device_status)
+      -> ctrl = &g_tlp_ctx->vnet_controller[dev->pf_index]
+      -> ctrl->max_queue_pairs = g_tlp_ctx->max_queue_pairs 或 1
+         // 取决于 dev->driver_features 是否同时协商 VIRTIO_NET_F_CTRL_VQ 和 VIRTIO_NET_F_MQ
+      -> pci_cfg_workqueue_submit_engine_start(ctrl)
+          -> doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine)
+          -> doca_devemu_virtio_offload_engine_start(virtio_engine)
+      -> pci_cfg_workqueue_submit_initialize_vqs(ctrl)
+          -> for i in [0, ctrl->max_queue_pairs):
+              -> doca_devemu_vnet_rx_vq_create(ctrl->offload_engine, &ctrl->rx_vqs[i])
+              -> doca_devemu_vnet_tx_vq_create(ctrl->offload_engine, &ctrl->tx_vqs[i])
+          -> if ctrl->mq_feature_negotiated:
+              -> doca_devemu_vnet_ctrl_vq_create(ctrl->offload_engine, &ctrl->cvq)
+      -> pci_cfg_workqueue_submit_initialize_io_context(ctrl)
+          -> doca_devemu_vnet_io_create_from_offload_engine(ctrl->offload_engine, &ctrl->io_ctx)
+          -> doca_devemu_vnet_io_as_virtio_io(ctrl->io_ctx)
+          -> doca_devemu_virtio_io_as_ctx(virtio_io)
+          -> doca_pe_connect_ctx(ctrl->worker_pe, io_ctx)
+          -> doca_devemu_vnet_io_event_vnet_ctrl_req_register(ctrl->io_ctx,
+                                                              vnet_pci_dev_ctrl_req_handler)
+          -> doca_ctx_start(io_ctx)
 
-    if (cleanup_running) {
-        ctrl->deferred_init_pending = true;
-        return;
-    }
+Host 写 DRIVER_OK 或后续 VQ 配置更新后的异步启用路径：
+  // [Doorbell/DMA通道] Host 写 DRIVER_OK 或完成后续 VQ 配置更新后，
+  //                  由 workqueue 启动 VQ 并 enable engine。Host 写入
+  //                  queue_desc/queue_driver/queue_device 后，
+  //                  通过 set_conf/start/enable 让 offload engine 读写 Host 内存。
+  -> pci_cfg_workqueue_submit_start_and_enable(ctrl, dev)
+      -> vqs = vnet_pci_device_get_virtq_pci_cfg(dev)
+         // vqs[*].queue_size/msix_vector/desc/driver/device 全部来自 Host 对 virtio common cfg 的 TLP 写
+      -> for active RX/TX VQ:
+          -> doca_devemu_vnet_rx_vq_as_vq(ctrl->rx_vqs[i])
+          -> doca_devemu_virtio_vq_set_conf(rx_vq, rx_idx, vqs[rx_idx].queue_size,
+                                            vqs[rx_idx].queue_msix_vector,
+                                            vqs[rx_idx].queue_desc,
+                                            vqs[rx_idx].queue_driver,
+                                            vqs[rx_idx].queue_device)
+          -> doca_devemu_virtio_vq_start(rx_vq)
+          -> doca_devemu_vnet_tx_vq_as_vq(ctrl->tx_vqs[i])
+          -> doca_devemu_virtio_vq_set_conf(tx_vq, tx_idx, vqs[tx_idx].queue_size,
+                                            vqs[tx_idx].queue_msix_vector,
+                                            vqs[tx_idx].queue_desc,
+                                            vqs[tx_idx].queue_driver,
+                                            vqs[tx_idx].queue_device)
+          -> doca_devemu_virtio_vq_start(tx_vq)
+      -> if CVQ ready:
+          -> doca_devemu_vnet_ctrl_vq_as_vq(ctrl->cvq)
+          -> doca_devemu_vnet_io_as_virtio_io(ctrl->io_ctx)
+          -> doca_devemu_virtio_vq_set_conf(cvq_vq, cvq_index, vqs[cvq_index].queue_size,
+                                            vqs[cvq_index].queue_msix_vector,
+                                            vqs[cvq_index].queue_desc,
+                                            vqs[cvq_index].queue_driver,
+                                            vqs[cvq_index].queue_device)
+          -> doca_devemu_virtio_vq_start(cvq_vq)
+          -> doca_devemu_virtio_io_bind_vq(virtio_io, cvq_vq, ctrl)
+      -> doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine)
+      -> doca_devemu_virtio_offload_engine_enable(virtio_engine)
+      -> doca_devemu_vnet_counters_create(ctrl->offload_engine, &ctrl->vnet_counters)
+      -> doca_devemu_vnet_counters_reset(ctrl->vnet_counters)
+      -> doca_devemu_virtio_offload_engine_queue_dbg_state_create_list(virtio_engine,
+                                                                       &state_list, &list_len)
+      -> diagnostics/stat collection on worker PE:
+          -> doca_devemu_virtio_queue_dbg_state_is_populated(state_list, &is_populated)
+          -> doca_devemu_virtio_queue_dbg_state_populate_list(state_list)
+          -> doca_devemu_virtio_queue_dbg_state_get_id(stats, &id)
+          -> doca_devemu_virtio_queue_dbg_state_get_enabled(stats, &enabled)
+          -> doca_devemu_virtio_queue_dbg_state_get_size(stats, &size)
+          -> doca_devemu_virtio_queue_dbg_state_get_inflights(stats, &inflights)
+          -> doca_devemu_virtio_queue_dbg_state_get_hw_avail_idx(stats, &hw_avail_idx)
+          -> doca_devemu_virtio_queue_dbg_state_get_driver_avail_idx(stats, &driver_avail_idx)
+          -> doca_devemu_virtio_queue_dbg_state_get_hw_used_idx(stats, &hw_used_idx)
+          -> doca_devemu_virtio_queue_dbg_state_get_driver_used_idx(stats, &driver_used_idx)
+          -> doca_devemu_vnet_counters_populate_sync(ctrl->vnet_counters)
+          -> doca_devemu_vnet_counters_rx_vq_query(ctrl->vnet_counters, vq_index, &rx_cnt)
+          -> doca_devemu_vnet_counters_tx_vq_query(ctrl->vnet_counters, vq_index, &tx_cnt)
 
-    ctrl->mq_feature_negotiated =
-        driver_features_has(VIRTIO_NET_F_CTRL_VQ) &&
-        driver_features_has(VIRTIO_NET_F_MQ);
+CVQ/MQ 控制请求路径：
+  // [Doorbell/DMA通道] CVQ 绑定到 IO context 后，Host 的 virtio-net 控制请求在这里完成。
+  -> vnet_pci_dev_ctrl_req_handler(req, cls, cmd, user_data)
+      -> doca_devemu_vnet_ctrl_req_get_vq_user_data(req)       // bind_vq 时传入的 ctrl
+      -> if cls == VIRTIO_NET_CTRL_MQ && cmd == VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET:
+          -> doca_devemu_vnet_ctrl_req_get_data_len(req)
+          -> doca_devemu_vnet_ctrl_req_get_data(req)
+          -> doca_buf_get_data(data_buf, &data_ptr)            // data_ptr 指向 Host CVQ 命令体
+          -> doca_devemu_vnet_ctrl_req_complete(req, ack, sizeof(uint8_t))
+          -> if new_qps > old_qps:
+              -> doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine)
+              -> doca_devemu_virtio_vq_set_conf(rx_vq/tx_vq, vq_idx, vqs[vq_idx].*)
+              -> doca_devemu_virtio_vq_start(rx_vq/tx_vq)
+              -> doca_devemu_virtio_vq_group_enable(virtio_engine,
+                                                    start_vq_idx = old_qps * 2,
+                                                    end_vq_idx = new_qps * 2 - 1)
+          -> if new_qps < old_qps:
+              -> doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine)
+              -> doca_devemu_virtio_vq_group_disable(virtio_engine,
+                                                     start_vq_idx = new_qps * 2,
+                                                     end_vq_idx = old_qps * 2 - 1)
+              -> doca_devemu_virtio_vq_stop(rx_vq/tx_vq)
+      -> else:
+          -> doca_devemu_vnet_ctrl_req_complete(req, ack, sizeof(uint8_t))
 
-    ctrl->num_active_qps = ctrl->mq_feature_negotiated ? 1 : 1;
-    ctrl->max_queue_pairs = ctrl->mq_feature_negotiated ? configured_max_qps : 1;
-
-    /* 下列工作交给 PCI config workqueue，在 worker PE 上执行 */
-    if (!ctrl->offload_engine_started)
-        enqueue(engine_start);
-    enqueue(initialize_vqs);
-    enqueue(initialize_io_context);   /* 仅 MQ/CVQ 模式需要 */
-
-/* Host 写 DRIVER_OK：启动 VQ 并 enable engine */
-on_driver_ok(dev):
-    ctrl = controller_for(dev);
-
-    if (!ctrl->engine_enabled)
-        enqueue(start_and_enable);
-```
-
-### 3.3 按功能块重组的 vnet DOCA API 伪代码
-
-```c
-int vnet_main_flow(config)
-{
-    /*
-     * 功能块 A：日志、参数、信号
-     */
-    doca_log_backend_create_standard();
-    doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
-    doca_argp_init("doca_vnet_pci_dev", &config);
-    register_vnet_args();
-    doca_argp_start(argc, argv);
-    install_signal_handlers();
-
-    /*
-     * 功能块 B：打开设备与主 PE
-     */
-    tlp_ctx = alloc_tlp_context(config.num_ep, config.hotplug_mode);
-    if (config.ibdev_name)
-        open_doca_device_with_ibdev_name(config.ibdev_name, &tlp_ctx->dev);
-    else
-        open_doca_device_with_pci(config.pci_address, &tlp_ctx->dev);
-    doca_pe_create(&tlp_ctx->pe);             // PE1: TLP 快路径
-
-    /*
-     * 功能块 C：创建 PCI TLP type 与 TLP channel
-     */
-    doca_devemu_vnet_pci_tlp_type_create("vnet_pci_vnet", &tlp_ctx->pci_type);
-    doca_devemu_pci_type_set_dev(tlp_ctx->pci_type, tlp_ctx->dev);
-    doca_devemu_pci_tlp_type_set_pci_cap_conf(tlp_ctx->pci_type, EXP, ...);
-    doca_devemu_pci_tlp_type_set_pci_cap_conf(tlp_ctx->pci_type, MSIX, ...);
-    doca_devemu_pci_type_set_num_msix(tlp_ctx->pci_type, VNET_PCI_DEV_NUM_MSIX);
-    doca_devemu_pci_type_set_num_db(tlp_ctx->pci_type, VNET_PCI_DEV_NUM_DB);
-    doca_devemu_pci_type_start(tlp_ctx->pci_type);
-
-    doca_devemu_pci_tlp_channel_create(tlp_ctx->dev, &tlp_ctx->tlp_channel);
-    doca_devemu_pci_tlp_channel_event_req_register(tlp_ctx->tlp_channel, vnet_tlp_req_cb);
-    doca_devemu_pci_tlp_channel_set_acg_enabled(tlp_ctx->tlp_channel, true);
-    doca_pe_connect_ctx(tlp_ctx->pe, doca_devemu_pci_tlp_channel_as_ctx(tlp_ctx->tlp_channel));
-    doca_ctx_start(doca_devemu_pci_tlp_channel_as_ctx(tlp_ctx->tlp_channel));
-
-    /*
-     * 功能块 D：初始化 PCI 拓扑与 VNet 子系统
-     */
-    init_software_pci_topology(tlp_ctx);       // 1 USP + N DSP + N EP
-    doca_devemu_vnet_add_dev(tlp_ctx->dev);
-    doca_devemu_vnet_init();
-
-    /*
-     * 功能块 E：创建 virtio-net 设备模型
-     */
-    vnet_pci_device_create(tlp_ctx, {
-        .num_queues = config.max_queue_pairs * 2 + 1,
-        .queue_size = config.queue_size,
-        .device_features = VNET_PCI_DEV_DEFAULT_FEATURES,
-        .dev_cfg = {mac, mtu, speed, duplex, link_up},
-        .pci_cfg_change_cb = virtio_net_ctrl_change_cb,
-    });
-
-    /*
-     * 功能块 F：创建 endpoint 与 VNet offload engine
-     */
-    for each ep in static_mode:
-        doca_devemu_pci_type_create_rep(tlp_ctx->pci_type, &ep->rep);
-        doca_devemu_pci_tlp_dev_create(tlp_ctx->pci_type, ep->rep, &ep->tlp_dev);
-        doca_devemu_pci_tlp_dev_start(ep->tlp_dev);
-
-        pci_ep = doca_devemu_pci_tlp_dev_as_ep(ep->tlp_dev);
-        doca_devemu_vnet_offload_engine_create(pci_ep, &ctrl->offload_engine);
-        virtio_engine = doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine);
-        doca_devemu_virtio_offload_engine_set_shm_dir_path(virtio_engine, shm_dir);
-        doca_devemu_vnet_offload_engine_set_mtu(ctrl->offload_engine, config.mtu);
-        doca_devemu_vnet_offload_engine_set_mac(ctrl->offload_engine, ep_mac);
-        doca_devemu_virtio_offload_engine_set_num_queues(virtio_engine, total_vqs);
-
-    /*
-     * 功能块 G：worker PE 与异步重操作
-     */
-    for each ctrl:
-        doca_pe_create(&ctrl->worker_pe);      // PE2: VQ/IO/stat 等重操作
-    pci_cfg_workqueue_set_worker_pes(all_worker_pes);
-
-    /*
-     * 功能块 H：主循环，只推进 TLP 快路径
-     */
-    while (!force_quit) {
-        doca_pe_progress(tlp_ctx->pe);
-        retry_acg_msi_if_needed();
-        read_stdin_and_enqueue_hotplug_or_speed_command();
-    }
-
-    /*
-     * 功能块 I：清理，严格反向顺序
-     */
-    pci_cfg_workqueue_shutdown();
-    for each ctrl:
-        doca_devemu_virtio_vq_disable(all_vqs);
-        doca_devemu_virtio_offload_engine_disable(virtio_engine);
-        doca_devemu_virtio_vq_stop(all_vqs);
-        doca_devemu_virtio_io_unbind_vq(cvq);
-        doca_ctx_stop(vnet_io_ctx);
-        doca_devemu_vnet_io_destroy(ctrl->io_ctx);
-        doca_devemu_vnet_rx_vq_destroy(all_rx_vqs);
-        doca_devemu_vnet_tx_vq_destroy(all_tx_vqs);
-        doca_devemu_vnet_ctrl_vq_destroy(ctrl->cvq);
-        doca_devemu_virtio_offload_engine_stop(virtio_engine);
-        doca_devemu_vnet_offload_engine_destroy(ctrl->offload_engine);
-
-    doca_ctx_stop(tlp_channel_ctx);
-    doca_devemu_pci_tlp_channel_destroy(tlp_ctx->tlp_channel);
-    doca_devemu_pci_type_stop(tlp_ctx->pci_type);
-    doca_devemu_pci_type_destroy(tlp_ctx->pci_type);
-    doca_devemu_vnet_teardown();
-    doca_devemu_vnet_rm_dev(tlp_ctx->dev);
-    doca_pe_destroy(tlp_ctx->pe);
-    doca_dev_close(tlp_ctx->dev);
-}
+vnet_pci_dev_destroy_device(tlp_ctx == g_tlp_ctx, endpoint)
+  // [Doorbell/DMA通道] 先停数据面：VQ/IO/counters/offload engine。
+  -> vnet_pci_dev_vnet_controller_destroy(g_tlp_ctx, endpoint)
+      -> vnet_pci_dev_shutdown_device()
+          -> vnet_controller_cleanup(destroy_engine=true)
+              -> doca_pe_progress(ctrl->worker_pe)             // drain stats/counters in progress
+              -> doca_devemu_vnet_counters_destroy(ctrl->vnet_counters)
+              -> doca_devemu_virtio_queue_dbg_state_destroy_list(local_ref->state_list)
+              -> doca_devemu_pci_msix_destroy(ctrl->config_msix)
+              -> doca_devemu_vnet_offload_engine_as_virtio_offload(ctrl->offload_engine)
+              -> doca_devemu_vnet_rx_vq_as_vq(ctrl->rx_vqs[i])
+              -> doca_devemu_vnet_tx_vq_as_vq(ctrl->tx_vqs[i])
+              -> doca_devemu_vnet_ctrl_vq_as_vq(ctrl->cvq)
+              -> doca_devemu_virtio_vq_disable(vq)
+              -> doca_devemu_virtio_offload_engine_disable(virtio_engine)
+              -> doca_devemu_vnet_io_as_virtio_io(ctrl->io_ctx)
+              -> doca_devemu_virtio_io_flush_vq(virtio_io, cvq_vq)
+              -> doca_devemu_virtio_io_unbind_vq(virtio_io, cvq_vq)
+              -> doca_devemu_virtio_vq_stop(vq)
+              -> doca_devemu_virtio_io_as_ctx(virtio_io)
+              -> doca_ctx_flush_tasks(io_ctx)
+              -> doca_ctx_stop(io_ctx)
+              -> while io_ctx not IDLE:
+                  -> doca_pe_progress(ctrl->worker_pe)
+                  -> doca_ctx_get_state(io_ctx, &ctx_state)
+              -> doca_devemu_vnet_io_destroy(saved_io_ctx)
+              -> doca_devemu_vnet_rx_vq_destroy(ctrl->rx_vqs[i])
+              -> doca_devemu_vnet_tx_vq_destroy(ctrl->tx_vqs[i])
+              -> doca_devemu_vnet_ctrl_vq_destroy(ctrl->cvq)
+              -> doca_devemu_virtio_offload_engine_stop(virtio_engine)
+              -> doca_devemu_vnet_offload_engine_destroy(ctrl->offload_engine)
+  // [PCI设备模拟] 再停 endpoint：TLP device 和 representor。
+  -> doca_devemu_pci_tlp_dev_stop(endpoint->tlp_dev)
+  -> doca_devemu_pci_tlp_dev_destroy(endpoint->tlp_dev)
+  -> doca_devemu_pci_type_destroy_rep(endpoint->rep)
+     或 LU standby: doca_dev_rep_close(endpoint->rep)
 ```
 
 ## 4. vblk_pci_dev 主干流程
