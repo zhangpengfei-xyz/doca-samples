@@ -39,6 +39,18 @@ DOCA_LOG_REGISTER(VBLK_PCI_DEV);
 /* Global signal handling */
 volatile bool force_quit = false;
 
+static struct vblk_pci_dev_config g_config = {
+	.num_ep = VBLK_PCI_DEV_DEFAULT_NUM_EP,
+	.num_queues = VBLK_PCI_DEV_DEFAULT_NUM_QUEUES,
+	.seg_max = 126,
+	.io_ctx_mask = VBLK_PCI_DEV_DEFAULT_IO_CTX_MASK,
+	.tlp_core_idx = VBLK_PCI_DEV_DEFAULT_TLP_CORE_IDX,
+	.offload_engine_core_idx = VBLK_PCI_DEV_DEFAULT_OFFLOAD_ENGINE_CORE_IDX,
+	.stats_ios_period = 0,
+	.datapath_on_dpa = true,
+	.hotplug_mode = true,
+};
+
 /**
  * @brief Signal handler for graceful shutdown
  *
@@ -508,17 +520,6 @@ static doca_error_t register_vblk_pci_dev_params(void)
  */
 int main(int argc, char **argv)
 {
-	struct vblk_pci_dev_config config = {
-		.num_ep = VBLK_PCI_DEV_DEFAULT_NUM_EP,
-		.num_queues = VBLK_PCI_DEV_DEFAULT_NUM_QUEUES,
-		.seg_max = 126,
-		.io_ctx_mask = VBLK_PCI_DEV_DEFAULT_IO_CTX_MASK,
-		.tlp_core_idx = VBLK_PCI_DEV_DEFAULT_TLP_CORE_IDX,
-		.offload_engine_core_idx = VBLK_PCI_DEV_DEFAULT_OFFLOAD_ENGINE_CORE_IDX,
-		.stats_ios_period = 0,
-		.datapath_on_dpa = true,
-		.hotplug_mode = true,
-	};
 	struct doca_log_backend *sdk_log;
 	int exit_status = EXIT_FAILURE;
 	doca_error_t result;
@@ -539,7 +540,7 @@ int main(int argc, char **argv)
 	DOCA_LOG_INFO("Starting DOCA VirtIO Block PCI Device application");
 
 	/* Parse application arguments */
-	result = doca_argp_init("doca_vblk_pci_dev", &config);
+	result = doca_argp_init("doca_vblk_pci_dev", &g_config);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init ARGP resources: %s", doca_error_get_descr(result));
 		return EXIT_FAILURE;
@@ -562,19 +563,19 @@ int main(int argc, char **argv)
 	signal(SIGTERM, signal_handler);
 
 	DOCA_LOG_INFO("Configuration:");
-	DOCA_LOG_INFO("  Device: %s", config.device_name);
-	DOCA_LOG_INFO("  Endpoints: %u", config.num_ep);
-	DOCA_LOG_INFO("  Queues/EP: %u", config.num_queues);
-	DOCA_LOG_INFO("  Hotplug: %s", config.hotplug_mode ? "enabled" : "disabled");
-	DOCA_LOG_INFO("  IO Context Mask: 0x%lx", config.io_ctx_mask);
-	DOCA_LOG_INFO("  TLP Core: %u", config.tlp_core_idx);
-	DOCA_LOG_INFO("  Offload Engine Core: %u", config.offload_engine_core_idx);
+	DOCA_LOG_INFO("  Device: %s", g_config.device_name);
+	DOCA_LOG_INFO("  Endpoints: %u", g_config.num_ep);
+	DOCA_LOG_INFO("  Queues/EP: %u", g_config.num_queues);
+	DOCA_LOG_INFO("  Hotplug: %s", g_config.hotplug_mode ? "enabled" : "disabled");
+	DOCA_LOG_INFO("  IO Context Mask: 0x%lx", g_config.io_ctx_mask);
+	DOCA_LOG_INFO("  TLP Core: %u", g_config.tlp_core_idx);
+	DOCA_LOG_INFO("  Offload Engine Core: %u", g_config.offload_engine_core_idx);
 	DOCA_LOG_INFO("Runtime commands (enter via stdin):");
 	DOCA_LOG_INFO("  cap <GB>  - Set block device capacity in GB (e.g. cap 1)");
-	DOCA_LOG_INFO(" Datapath Provider: %s", config.datapath_on_dpa ? "DPA" : "DPU");
+	DOCA_LOG_INFO(" Datapath Provider: %s", g_config.datapath_on_dpa ? "DPA" : "DPU");
 
 	/* Run the core VirtIO Block PCI device logic */
-	result = vblk_pci_dev_run(&config);
+	result = vblk_pci_dev_run(&g_config);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("VirtIO Block PCI device failed: %s", doca_error_get_descr(result));
 		goto destroy_argp;

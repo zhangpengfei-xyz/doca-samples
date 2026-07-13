@@ -128,6 +128,9 @@ static struct vblk_pci_dev_resources s_resources;
 /* Static IO ops structure - must outlive threads that reference it */
 static struct vblk_io_ctx_app_ops s_io_ops;
 
+static struct vblk_tlp_ctx_cfg g_tlp_cfg;
+static struct vblk_io_ctx_cfg *g_io_cfgs;
+
 /**
  * @brief Close DOCA library resources
  *
@@ -410,14 +413,12 @@ static void shared_mpools_destroy(struct vblk_pci_dev_resources *res)
  *
  * @param[in] res Application resources
  * @param[in] config Application configuration
- * @param[in] io_cfgs IO context thread configs array
  * @param[in] io_ctx_cores CPU core mapping for IO contexts
  * @param[out] num_created Number of threads successfully created
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  */
 static doca_error_t vblk_io_ctx_oe_threads_create(struct vblk_pci_dev_resources *res,
 						  struct vblk_pci_dev_config *config,
-						  struct vblk_io_ctx_cfg *io_cfgs,
 						  uint8_t *io_ctx_cores,
 						  uint8_t *num_created)
 {
@@ -436,23 +437,23 @@ static doca_error_t vblk_io_ctx_oe_threads_create(struct vblk_pci_dev_resources 
 	s_io_ops.wait_pci_stopped = app_wait_pci_stopped;
 
 	for (uint8_t ctx_id = 0; ctx_id < res->num_io_ctx; ctx_id++) {
-		io_cfgs[ctx_id].pe = res->io_pe_ctxs[ctx_id].pe;
-		io_cfgs[ctx_id].ctrls = res->vblk_ctrls;
-		io_cfgs[ctx_id].hp_states = res->hp_states;
-		io_cfgs[ctx_id].num_ep = config->num_ep;
-		io_cfgs[ctx_id].ctx_id = ctx_id;
-		io_cfgs[ctx_id].affinity_core = io_ctx_cores[ctx_id];
-		io_cfgs[ctx_id].offload_engine_core_idx = config->offload_engine_core_idx;
-		io_cfgs[ctx_id].num_io_ctx = res->num_io_ctx;
-		io_cfgs[ctx_id].num_queues = config->num_queues;
-		io_cfgs[ctx_id].seg_max = config->seg_max ? config->seg_max : 1;
-		io_cfgs[ctx_id].indirect_enabled = config->indirect_enabled;
-		io_cfgs[ctx_id].hotplug_mode = config->hotplug_mode;
-		io_cfgs[ctx_id].stats_ios_period = config->stats_ios_period;
-		io_cfgs[ctx_id].shared_mpool = res->shared_mpools[ctx_id];
-		io_cfgs[ctx_id].ops = &s_io_ops;
+		g_io_cfgs[ctx_id].pe = res->io_pe_ctxs[ctx_id].pe;
+		g_io_cfgs[ctx_id].ctrls = res->vblk_ctrls;
+		g_io_cfgs[ctx_id].hp_states = res->hp_states;
+		g_io_cfgs[ctx_id].num_ep = config->num_ep;
+		g_io_cfgs[ctx_id].ctx_id = ctx_id;
+		g_io_cfgs[ctx_id].affinity_core = io_ctx_cores[ctx_id];
+		g_io_cfgs[ctx_id].offload_engine_core_idx = config->offload_engine_core_idx;
+		g_io_cfgs[ctx_id].num_io_ctx = res->num_io_ctx;
+		g_io_cfgs[ctx_id].num_queues = config->num_queues;
+		g_io_cfgs[ctx_id].seg_max = config->seg_max ? config->seg_max : 1;
+		g_io_cfgs[ctx_id].indirect_enabled = config->indirect_enabled;
+		g_io_cfgs[ctx_id].hotplug_mode = config->hotplug_mode;
+		g_io_cfgs[ctx_id].stats_ios_period = config->stats_ios_period;
+		g_io_cfgs[ctx_id].shared_mpool = res->shared_mpools[ctx_id];
+		g_io_cfgs[ctx_id].ops = &s_io_ops;
 
-		err = vblk_io_ctx_thread_create(&io_cfgs[ctx_id], &res->io_pe_ctxs[ctx_id].thread);
+		err = vblk_io_ctx_thread_create(&g_io_cfgs[ctx_id], &res->io_pe_ctxs[ctx_id].thread);
 		if (err != DOCA_SUCCESS)
 			return err;
 		(*num_created)++;
@@ -481,31 +482,29 @@ static void vblk_app_join_io_and_tlp_threads(struct vblk_pci_dev_resources *res,
  *
  * @param[in] res Application resources
  * @param[in] config Application configuration
- * @param[in] io_cfgs IO context thread configs array
  * @param[in] io_ctx_cores CPU core mapping for IO contexts
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  */
 static doca_error_t progress_contexts_start(struct vblk_pci_dev_resources *res,
 					    struct vblk_pci_dev_config *config,
-					    struct vblk_io_ctx_cfg *io_cfgs,
 					    uint8_t *io_ctx_cores)
 {
-	struct vblk_tlp_ctx_cfg tlp_cfg = {0};
 	uint8_t num_io_threads = 0;
 	doca_error_t err;
 
 	vblk_app_err = DOCA_SUCCESS;
 
-	tlp_cfg.pe = res->tlp_pe_ctx.pe;
-	tlp_cfg.hp_states = res->hp_states;
-	tlp_cfg.hotplug_mode = config->hotplug_mode;
-	tlp_cfg.num_ep = config->num_ep;
-	tlp_cfg.signal_pci_stopped = app_signal_pci_stopped;
-	err = vblk_pci_tlp_thread_create(&tlp_cfg, &res->tlp_pe_ctx.thread, config->tlp_core_idx);
+	memset(&g_tlp_cfg, 0, sizeof(g_tlp_cfg));
+	g_tlp_cfg.pe = res->tlp_pe_ctx.pe;
+	g_tlp_cfg.hp_states = res->hp_states;
+	g_tlp_cfg.hotplug_mode = config->hotplug_mode;
+	g_tlp_cfg.num_ep = config->num_ep;
+	g_tlp_cfg.signal_pci_stopped = app_signal_pci_stopped;
+	err = vblk_pci_tlp_thread_create(&g_tlp_cfg, &res->tlp_pe_ctx.thread, config->tlp_core_idx);
 	if (err != DOCA_SUCCESS)
 		return err;
 
-	err = vblk_io_ctx_oe_threads_create(res, config, io_cfgs, io_ctx_cores, &num_io_threads);
+	err = vblk_io_ctx_oe_threads_create(res, config, io_ctx_cores, &num_io_threads);
 	if (err != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to create progress context threads");
 		goto force_quit_label;
@@ -674,7 +673,6 @@ void vblk_pci_dev_resources_cleanup(struct vblk_pci_dev_resources *resources)
 doca_error_t vblk_pci_dev_run(struct vblk_pci_dev_config *config)
 {
 	uint8_t io_ctx_cores[VBLK_PCI_DEV_MAX_IO_CORES] = {0};
-	struct vblk_io_ctx_cfg *io_cfgs = NULL;
 	uint8_t num_io_ctx = 0;
 	doca_error_t err;
 
@@ -700,8 +698,8 @@ doca_error_t vblk_pci_dev_run(struct vblk_pci_dev_config *config)
 	}
 
 	/* Allocate IO context thread configs */
-	io_cfgs = calloc(num_io_ctx, sizeof(struct vblk_io_ctx_cfg));
-	if (io_cfgs == NULL) {
+	g_io_cfgs = calloc(num_io_ctx, sizeof(struct vblk_io_ctx_cfg));
+	if (g_io_cfgs == NULL) {
 		DOCA_LOG_ERR("Failed to allocate IO context configs");
 		err = DOCA_ERROR_NO_MEMORY;
 		goto cleanup;
@@ -745,7 +743,7 @@ doca_error_t vblk_pci_dev_run(struct vblk_pci_dev_config *config)
 	DOCA_LOG_INFO("VBlk device initialized successfully (%u EPs)", config->num_ep);
 
 	/* Start contexts and run progress loop (blocks until force_quit) */
-	err = progress_contexts_start(&s_resources, config, io_cfgs, io_ctx_cores);
+	err = progress_contexts_start(&s_resources, config, io_ctx_cores);
 	if (err != DOCA_SUCCESS)
 		DOCA_LOG_ERR("Progress context error: %s", doca_error_get_descr(err));
 
@@ -764,7 +762,8 @@ cleanup_pe:
 
 cleanup:
 	vblk_pci_dev_resources_cleanup(&s_resources);
-	free(io_cfgs);
+	free(g_io_cfgs);
+	g_io_cfgs = NULL;
 
 	return err;
 }

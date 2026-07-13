@@ -118,6 +118,8 @@ static struct vblk_pci_dev_resources s_resources;
 /* Static IO ops structure - must outlive threads that reference it */
 static struct vblk_io_ctx_app_ops s_io_ops;
 
+static struct vblk_io_ctx_cfg *g_io_cfgs;
+
 /**
  * @brief Signal that the VBlk controller has been created (or failed)
  *
@@ -265,14 +267,12 @@ static void app_wait_all_io_exited(uint8_t expected)
  *
  * @param[in] res Application resources
  * @param[in] config Application configuration
- * @param[in] io_cfgs IO context thread configs array
  * @param[in] io_ctx_cores CPU core mapping for IO contexts
  * @param[out] num_created Number of threads successfully created
  * @return DOCA_SUCCESS on success, DOCA_ERROR_* on failure
  */
 static doca_error_t vblk_io_ctx_oe_threads_create(struct vblk_pci_dev_resources *res,
 						  struct vblk_pci_dev_config *config,
-						  struct vblk_io_ctx_cfg *io_cfgs,
 						  uint8_t *io_ctx_cores,
 						  uint8_t *num_created)
 {
@@ -291,20 +291,20 @@ static doca_error_t vblk_io_ctx_oe_threads_create(struct vblk_pci_dev_resources 
 	s_io_ops.wait_all_io_exited = app_wait_all_io_exited;
 
 	for (uint8_t ctx_id = 0; ctx_id < res->num_io_ctx; ctx_id++) {
-		io_cfgs[ctx_id].pe = res->io_pe_ctxs[ctx_id].pe;
-		io_cfgs[ctx_id].ctrl = &res->vblk_ctrl;
-		io_cfgs[ctx_id].ctx_id = ctx_id;
-		io_cfgs[ctx_id].affinity_core = io_ctx_cores[ctx_id];
-		io_cfgs[ctx_id].offload_engine_core_idx = config->offload_engine_core_idx;
-		io_cfgs[ctx_id].num_io_ctx = res->num_io_ctx;
-		io_cfgs[ctx_id].num_queues = config->num_queues;
-		io_cfgs[ctx_id].seg_max = config->seg_max ? config->seg_max : 1;
-		io_cfgs[ctx_id].indirect_enabled = config->indirect_enabled;
-		io_cfgs[ctx_id].stats_ios_period = config->stats_ios_period;
-		io_cfgs[ctx_id].shm_dir_path = config->shm_dir_path;
-		io_cfgs[ctx_id].ops = &s_io_ops;
+		g_io_cfgs[ctx_id].pe = res->io_pe_ctxs[ctx_id].pe;
+		g_io_cfgs[ctx_id].ctrl = &res->vblk_ctrl;
+		g_io_cfgs[ctx_id].ctx_id = ctx_id;
+		g_io_cfgs[ctx_id].affinity_core = io_ctx_cores[ctx_id];
+		g_io_cfgs[ctx_id].offload_engine_core_idx = config->offload_engine_core_idx;
+		g_io_cfgs[ctx_id].num_io_ctx = res->num_io_ctx;
+		g_io_cfgs[ctx_id].num_queues = config->num_queues;
+		g_io_cfgs[ctx_id].seg_max = config->seg_max ? config->seg_max : 1;
+		g_io_cfgs[ctx_id].indirect_enabled = config->indirect_enabled;
+		g_io_cfgs[ctx_id].stats_ios_period = config->stats_ios_period;
+		g_io_cfgs[ctx_id].shm_dir_path = config->shm_dir_path;
+		g_io_cfgs[ctx_id].ops = &s_io_ops;
 
-		err = vblk_io_ctx_thread_create(&io_cfgs[ctx_id], &res->io_pe_ctxs[ctx_id].thread);
+		err = vblk_io_ctx_thread_create(&g_io_cfgs[ctx_id], &res->io_pe_ctxs[ctx_id].thread);
 		if (err != DOCA_SUCCESS)
 			return err;
 		(*num_created)++;
@@ -502,7 +502,6 @@ doca_error_t vblk_pci_dev_emu_run(struct vblk_pci_dev_config *config,
 				  int role)
 {
 	uint8_t io_ctx_cores[VBLK_APP_BF3_MAX_IO_CORES];
-	struct vblk_io_ctx_cfg *io_cfgs = NULL;
 	uint8_t num_io_ctx = 0, num_io_threads = 0;
 	doca_error_t err;
 
@@ -542,8 +541,8 @@ doca_error_t vblk_pci_dev_emu_run(struct vblk_pci_dev_config *config,
 			return err;
 	}
 
-	io_cfgs = calloc(num_io_ctx, sizeof(struct vblk_io_ctx_cfg));
-	if (io_cfgs == NULL) {
+	g_io_cfgs = calloc(num_io_ctx, sizeof(struct vblk_io_ctx_cfg));
+	if (g_io_cfgs == NULL) {
 		err = DOCA_ERROR_NO_MEMORY;
 		goto cleanup;
 	}
@@ -560,12 +559,12 @@ doca_error_t vblk_pci_dev_emu_run(struct vblk_pci_dev_config *config,
 	 * Multi-device: passing ep to each io_ctx_cfg should be reconsidered, as it will be per-device.
 	 */
 	for (int i = 0; i < num_io_ctx; i++) {
-		io_cfgs[i].ep = ep;
-		io_cfgs[i].ipc_poll = emu_ipc_poll;
-		io_cfgs[i].ipc_poll_arg = &ho_ctx;
+		g_io_cfgs[i].ep = ep;
+		g_io_cfgs[i].ipc_poll = emu_ipc_poll;
+		g_io_cfgs[i].ipc_poll_arg = &ho_ctx;
 	}
 
-	err = vblk_io_ctx_oe_threads_create(&s_resources, config, io_cfgs, io_ctx_cores, &num_io_threads);
+	err = vblk_io_ctx_oe_threads_create(&s_resources, config, io_ctx_cores, &num_io_threads);
 	if (err != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("EMU: failed to create threads");
 		goto force_quit;
@@ -672,6 +671,7 @@ cleanup_pe:
 cleanup:
 	vblk_export_desc_free(&ho_ctx.export_desc, &ho_ctx.export_desc_len);
 	vblk_pci_dev_resources_cleanup(&s_resources);
-	free(io_cfgs);
+	free(g_io_cfgs);
+	g_io_cfgs = NULL;
 	return err;
 }

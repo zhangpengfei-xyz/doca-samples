@@ -56,6 +56,8 @@ DOCA_LOG_REGISTER(VBLK_EMU);
 
 volatile bool force_quit = false;
 
+static struct vblk_pci_dev_config g_config;
+
 static void signal_handler(int signum)
 {
 	if (signum == SIGTERM)
@@ -81,18 +83,17 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	struct vblk_pci_dev_config config = {0};
-	if (!vblk_config_deserialize(cfg_str, &config)) {
+	if (!vblk_config_deserialize(cfg_str, &g_config)) {
 		fprintf(stderr, "EMU: failed to parse %s\n", VBLK_EMU_CONFIG_ENV);
 		return EXIT_FAILURE;
 	}
 
 	/* Same invariants the CLI enforced; revalidate here so a tampered or
 	 * truncated env-var value cannot reach the offload engine setup path. */
-	if (vblk_validate_shm_dir_path(config.shm_dir_path) != DOCA_SUCCESS) {
+	if (vblk_validate_shm_dir_path(g_config.shm_dir_path) != DOCA_SUCCESS) {
 		fprintf(stderr,
 			"EMU: invalid shm_dir_path '%s' in %s (must be non-empty, absolute, no whitespace, <=%d chars)\n",
-			config.shm_dir_path,
+			g_config.shm_dir_path,
 			VBLK_EMU_CONFIG_ENV,
 			VBLK_SHM_DIR_PATH_LEN - 1);
 		return EXIT_FAILURE;
@@ -126,10 +127,10 @@ int main(int argc, char **argv)
 	const char *peer_path;
 	doca_error_t err;
 
-	_Static_assert(sizeof(app_cfg.device_name) == sizeof(config.device_name), "size mismatch");
-	memcpy(app_cfg.device_name, config.device_name, sizeof(app_cfg.device_name));
-	app_cfg.indirect_enabled = config.indirect_enabled;
-	app_cfg.datapath_on_dpa = config.datapath_on_dpa;
+	_Static_assert(sizeof(app_cfg.device_name) == sizeof(g_config.device_name), "size mismatch");
+	memcpy(app_cfg.device_name, g_config.device_name, sizeof(app_cfg.device_name));
+	app_cfg.indirect_enabled = g_config.indirect_enabled;
+	app_cfg.datapath_on_dpa = g_config.datapath_on_dpa;
 	err = vblk_init(&app_cfg, &dev);
 	if (err != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("EMU %s: vblk_init failed: %s", role_str, doca_error_get_descr(err));
@@ -142,7 +143,7 @@ int main(int argc, char **argv)
 		goto out_vblk;
 	}
 
-	pci_dev = vblk_pci_virtio_dev_open(config.num_queues);
+	pci_dev = vblk_pci_virtio_dev_open(g_config.num_queues);
 	if (!pci_dev) {
 		DOCA_LOG_ERR("EMU %s: failed to discover existing PCI endpoint", role_str);
 		goto out_pci;
@@ -158,7 +159,7 @@ int main(int argc, char **argv)
 	ep = doca_devemu_pci_tlp_dev_as_ep(pci_dev->pci_tlp_dev);
 	DOCA_LOG_INFO("EMU %s: starting (pid=%d)", role_str, getpid());
 
-	err = vblk_pci_dev_emu_run(&config, ep, &ipc, role);
+	err = vblk_pci_dev_emu_run(&g_config, ep, &ipc, role);
 
 	vblk_ipc_ep_close(&ipc);
 out_ep:
