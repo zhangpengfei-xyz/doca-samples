@@ -533,7 +533,624 @@ $HOST_SSH "lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL /dev/vda"
 | 写入 `/dev/vda` 后读回内容不一致 | 当前样例读写后端仍是占位实现，这是预期限制；只用 direct read/write 成功返回作为 smoke test |
 | `--provider DPA` 初始化失败 | 改用 `--provider DPU` 复测，并保留完整 DOCA 日志继续定位 |
 
-## 5. 后续章节模板
+## 5. samples/doca_devemu generic PCI samples
+
+### 5.1 适用范围与公共约定
+
+本章覆盖一组基于 `devemu_pci_type_config.h` 的 generic PCI DevEmu samples。它们分两类：
+
+| 类别 | sample | 目的 | 端侧 |
+| --- | --- | --- | --- |
+| endpoint 管理 | `devemu_pci_device_list` | 列出当前 generic emulated PCI devices，并打印 VUID/representor PCI | DPU only |
+| endpoint 管理 | `devemu_pci_device_hotplug` | 创建并 hotplug 新 generic endpoint；传入 VUID 时 hot-unplug 旧 endpoint | DPU only |
+| 功能验证 | `devemu_pci_device_db` | Host 写 BAR doorbell，DPU 收 doorbell value | DPU + Host |
+| 功能验证 | `devemu_pci_device_msix` | DPU raise MSI-X，Host eventfd 收中断 | DPU + Host |
+| 功能验证 | `devemu_pci_device_dma` | DPU 通过 DMA 读写 Host 暴露的 buffer | DPU + Host |
+| 功能验证 | `devemu_pci_device_stateful_region` | Host 写 stateful region，DPU 收 write event | DPU + Host |
+| 功能验证 | `devemu_pci_device_tlp_handler` | DPU 处理 raw PCIe TLP，Host 访问 transaction region | DPU + Host |
+
+公共规则：
+
+- DB/DMA/stateful region/MSI-X 都依赖一个已经 hotplug 且处于 power-on 状态的 generic emulated PCI endpoint，并通过
+  `-u "$EMU_VUID"` 指定该 endpoint。
+- `EMU_VUID` 是运行时 emulated device 的对象标识，不是 BF3 硬件固定值；BF3/DPU 重启后可能不存在，需要重新枚举或重新
+  hotplug 创建。
+- TLP handler 不复用 `EMU_VUID`；它会创建或复用自己的 TLP representor。
+- Host 端功能验证 samples 都通过 VFIO 打开 emulated endpoint，因此运行前需要绑定 `vfio-pci`。
+- 同一时间不要运行多个占用同一个 generic emulated endpoint 的 DevEmu sample。
+- Host VFIO open/close 可能触发 DPU 端 FLR 日志；除非 sample 明确失败，否则按预期现象处理。
+
+### 5.2 公共编译方式
+
+先编译 endpoint 管理 samples；它们用于获取或创建 `EMU_VUID`：
+
+```bash
+cd /root/ByteDance/doca-samples
+
+SAMPLE=samples/doca_devemu/devemu_pci_device_list
+meson setup "$SAMPLE/build" "$SAMPLE"
+ninja -C "$SAMPLE/build"
+
+SAMPLE=samples/doca_devemu/devemu_pci_device_hotplug
+meson setup "$SAMPLE/build" "$SAMPLE"
+ninja -C "$SAMPLE/build"
+```
+
+功能验证 samples 按 DPU/Host 两端分别编译。下面命令中的 `<sample-name>` 替换为具体 sample 目录名，例如
+`devemu_pci_device_dma`。
+
+DPU 端：
+
+```bash
+cd /root/ByteDance/doca-samples
+SAMPLE=samples/doca_devemu/<sample-name>
+meson setup "$SAMPLE/dpu/build" "$SAMPLE/dpu"
+ninja -C "$SAMPLE/dpu/build"
+```
+
+Host 端：
+
+```bash
+SAMPLE=samples/doca_devemu/<sample-name>
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  meson setup $SAMPLE/host/build $SAMPLE/host && \
+  ninja -C $SAMPLE/host/build"
+```
+
+功能验证 sample 的二进制命名规律：
+
+```text
+samples/doca_devemu/<sample-name>/dpu/build/doca_<sample-name>_dpu
+samples/doca_devemu/<sample-name>/host/build/doca_<sample-name>_host
+```
+
+### 5.3 选择或创建 generic emulated endpoint
+
+变量约定：
+
+```bash
+DPU_DEV=0000:03:00.0
+EMU_VUID=<从当前环境枚举或 hotplug 输出获取>
+HOST_EP=<Host 上当前 emulated endpoint BDF，例如 0000:40:00.0>
+HOST_VFIO_GROUP=<HOST_EP 所在 IOMMU group，例如 44>
+```
+
+DPU 端确认 DOCA device：
+
+```bash
+/opt/mellanox/doca/tools/doca_caps --list-devs
+```
+
+列出当前 generic emulated PCI devices：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_list/build/doca_devemu_pci_device_list \
+  -p "$DPU_DEV" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+也可以用 `doca_caps` 复查 representor：
+
+```bash
+/opt/mellanox/doca/tools/doca_caps --list-rep-devs
+```
+
+如果已有 `rep_type EMULATED` generic endpoint，把当前输出中的 VUID 填入 `EMU_VUID`。例如下面只是一次本地实测输出，
+不保证重启后仍存在：
+
+```text
+representor-PCI: 0000:40:00.0
+    hotplug yes
+    vuid MT2529603G38GES1D0F0
+    rep_type EMULATED
+```
+
+```bash
+EMU_VUID=<当前枚举到的 vuid>
+```
+
+如果列表为空，创建并 hotplug 一个新的 generic emulated PCI device：
+
+```bash
+./samples/doca_devemu/devemu_pci_device_hotplug/build/doca_devemu_pci_device_hotplug \
+  -p "$DPU_DEV" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+记录输出中的新 VUID：
+
+```text
+The new emulated device VUID: <new-vuid>
+```
+
+然后重新枚举 DPU representor 和 Host endpoint：
+
+```bash
+/opt/mellanox/doca/tools/doca_caps --list-rep-devs
+$HOST_SSH "lspci -Dnn | grep -i '15b3:1021'"
+$HOST_SSH "basename \$(readlink /sys/bus/pci/devices/<Host endpoint BDF>/iommu_group)"
+```
+
+设置当前测试变量：
+
+```bash
+EMU_VUID=<new-vuid>
+HOST_EP=<Host lspci 中的 endpoint BDF>
+HOST_VFIO_GROUP=<上一步 basename 输出，例如 44>
+```
+
+需要删除该 emulated endpoint 时，确保没有功能验证 sample 正在使用它，然后执行：
+
+```bash
+./samples/doca_devemu/devemu_pci_device_hotplug/build/doca_devemu_pci_device_hotplug \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+只绑定 `15b3:1021` emulated endpoint，不要绑定 Host 物理 PF `0000:3f:00.0` / `0000:5c:00.0`。
+
+### 5.4 Host VFIO 准备
+
+Host sample 运行前，将 emulated endpoint 绑定到 `vfio-pci`：
+
+```bash
+$HOST_SSH "modprobe vfio-pci && \
+  printf vfio-pci > /sys/bus/pci/devices/$HOST_EP/driver_override && \
+  printf $HOST_EP > /sys/bus/pci/drivers_probe && \
+  lspci -Dnnk -s $HOST_EP && \
+  ls -l /dev/vfio/$HOST_VFIO_GROUP"
+```
+
+期望 `lspci` 显示：
+
+```text
+Kernel driver in use: vfio-pci
+```
+
+如果 Host sample 报错：
+
+```text
+Failed to set IOMMU type 1 extension for container. Status=-1, errno=1
+```
+
+并且 Host `dmesg` 中有：
+
+```text
+No interrupt remapping support. Use the module param "allow_unsafe_interrupts" to enable VFIO IOMMU support on this platform
+```
+
+说明当前 Host 可能以 `intremap=off` 启动。仅做临时 smoke test 时可打开：
+
+```bash
+$HOST_SSH "printf 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts && \
+  cat /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts"
+```
+
+完成测试后必须按 5.5 清理并恢复该参数。
+
+### 5.5 公共清理
+
+Host 侧解除 `vfio-pci` 绑定并清除 driver override：
+
+```bash
+$HOST_SSH "if [ -e /sys/bus/pci/drivers/vfio-pci/$HOST_EP ]; then \
+    printf $HOST_EP > /sys/bus/pci/drivers/vfio-pci/unbind; \
+  fi; \
+  : > /sys/bus/pci/devices/$HOST_EP/driver_override; \
+  lspci -Dnnk -s $HOST_EP"
+```
+
+如果测试中临时打开了 `allow_unsafe_interrupts`，恢复为 `N`：
+
+```bash
+$HOST_SSH "printf 0 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts && \
+  cat /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts"
+```
+
+期望输出：
+
+```text
+N
+```
+
+如果测试前 Host endpoint 本来没有 `Kernel driver in use`，清理后解除 `vfio-pci` 并清空 `driver_override` 即可。不要强制把该
+emulated endpoint 绑定到 Host 物理 PF 驱动；本地实测对 `mlx5_core/bind` 写入该 endpoint 返回 `I/O error`，恢复到无绑定状态
+即可。
+
+如果 Host 上存在前次测试残留的 `doca_devemu_pci_*` 进程或卡在 `drivers_probe` 的 shell，先清理残留再绑定 VFIO。
+
+### 5.6 devemu_pci_device_db
+
+`devemu_pci_device_db` 验证 Host driver 写 PCI BAR doorbell，DPU/BlueField 侧通过 DPA doorbell completion 收到
+doorbell value。
+
+特有参数：
+
+| 参数 | 端侧 | 说明 |
+| --- | --- | --- |
+| `-u, --vuid` | DPU | emulated PCI device VUID |
+| `-r, --region-index` | DPU/Host | DB region index；基础测试使用 `0` |
+| `-i, --db-id` | DPU | DPU 端监听的 DB ID；基础测试使用 `0` |
+| `-d, --db-index` | Host | Host 端写入的 doorbell index；与 DPU `--db-id` 对齐 |
+| `-w, --db-value` | Host | Host 写入的 4B doorbell value |
+
+运行步骤：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_db/dpu/build/doca_devemu_pci_device_db_dpu \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -r 0 \
+  -i 0 \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+等待 DPU 日志出现：
+
+```text
+Listening on DB with ID 0
+```
+
+Host 端写 doorbell：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_db/host/build/doca_devemu_pci_device_db_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -r 0 \
+    -d 0 \
+    -w 5678 \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+通过条件：
+
+- DPU 端进入 `Listening on DB with ID 0`。
+- Host 端打印 `Wrote a DB value of 5678 ...` 并成功退出。
+- DPU 端打印 `Received Doorbell value is 5678`。
+- DPU 端按 `Ctrl+c` 后打印 `Sample finished successfully`。
+
+### 5.7 devemu_pci_device_msix
+
+`devemu_pci_device_msix` 验证 DPU/BlueField 侧对已有 generic emulated PCI device raise MSI-X vector，Host driver
+通过 VFIO eventfd 收到中断事件。
+
+当前 MSI-X 配置：
+
+```text
+num_vectors=4
+MSI-X table: BAR0 offset 0x1000
+PBA:         BAR0 offset 0x2000
+```
+
+特有参数：
+
+| 参数 | 端侧 | 说明 |
+| --- | --- | --- |
+| `-u, --vuid` | DPU | emulated PCI device VUID |
+| `-x, --msix-index` | DPU | 要 raise 的 MSI-X vector index；当前范围 `0..3` |
+| `--msix-on-dpu` | DPU | 可选；改用 DPU Arm 侧 raise MSI-X，不加时默认使用 DPA datapath |
+
+变量：
+
+```bash
+MSIX_INDEX=0
+```
+
+Host 端先启动监听：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_msix/host/build/doca_devemu_pci_device_msix_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+等待 Host 日志出现：
+
+```text
+Listening on all MSI-X vectors
+```
+
+DPU 端默认 DPA datapath raise MSI-X：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_msix/dpu/build/doca_devemu_pci_device_msix_dpu \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -x "$MSIX_INDEX" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+可选 DPU Arm 侧 raise 路径：
+
+```bash
+./samples/doca_devemu/devemu_pci_device_msix/dpu/build/doca_devemu_pci_device_msix_dpu \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -x "$MSIX_INDEX" \
+  --msix-on-dpu \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+通过条件：
+
+- Host 端进入 `Listening on all MSI-X vectors`。
+- DPU 端打印 `MSI-X raised successfully`。
+- Host 端打印 `Event received for MSI-X vector index 0 new value 1`。
+
+本地实测默认 DPA datapath 成功；第二次重复 VFIO probe 时 Host endpoint 没有重新绑定成功，因此未继续验证
+`--msix-on-dpu` 可选路径。
+
+### 5.8 devemu_pci_device_dma
+
+`devemu_pci_device_dma` 验证 Host driver 通过 VFIO/IOMMU 暴露 DMA buffer，DPU/BlueField 侧通过 DOCA DMA 对该
+Host memory 做双向复制。
+
+特有参数：
+
+| 参数 | 端侧 | 说明 |
+| --- | --- | --- |
+| `-u, --vuid` | DPU | emulated PCI device VUID |
+| `-a, --addr` | DPU | Host DMA memory IOVA；Host sample 固定使用 `0x1000000` |
+| `-d, --device-name` | DPU | 可选 DMA IB device 名称；不指定时使用 emulation manager 对应 DOCA device |
+| `-w, --write-data` | DPU/Host | Host 端为预写入 buffer 的字符串，DPU 端为写回 Host 的字符串 |
+
+变量：
+
+```bash
+HOST_DMA_IOVA=0x1000000
+```
+
+Host 端先启动并等待 DPU 写回：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_dma/host/build/doca_devemu_pci_device_dma_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -w host_dma_smoke \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+期望先输出：
+
+```text
+Allocated DMA memory(IOVA): 0x1000000
+Write to DMA memory: host_dma_smoke
+Wait for new DMA data from DPU--- ---
+```
+
+DPU 端后启动：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_dma/dpu/build/doca_devemu_pci_device_dma_dpu \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -a "$HOST_DMA_IOVA" \
+  -w dpu_dma_smoke \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+通过条件：
+
+- DPU 端打印 `Success, DMA memory copied from host: host_dma_smoke`。
+- DPU 端打印 `Success, DMA memory copied to host: dpu_dma_smoke`。
+- Host 端打印 `Read new data from DPU: dpu_dma_smoke`。
+- 两端均以 `Sample finished successfully` 结束。
+
+运行时可能出现：
+
+```text
+Memory range isn't aligned to 64B
+```
+
+这是示例程序本地 buffer 对齐导致的性能提示；基础功能 smoke test 中可忽略。
+
+### 5.9 devemu_pci_device_stateful_region
+
+`devemu_pci_device_stateful_region` 验证 Host driver 通过 VFIO mmap emulated endpoint BAR 中的 stateful region，
+DPU/BlueField 侧注册 stateful-region write event 并在 Host 写入时收到事件。
+
+当前 stateful region 配置：
+
+```text
+bar_id=0
+start_address=0x3000
+size=0x100
+```
+
+特有参数：
+
+| 参数 | 端侧 | 说明 |
+| --- | --- | --- |
+| `-u, --vuid` | DPU | emulated PCI device VUID |
+| `-r, --region-index` | Host | stateful region index；当前只有 `0` |
+| `-w, --write-data` | Host | 写入 stateful region 的 ASCII 字符串；为空字符串时执行 read/dump |
+
+DPU 端先启动：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_stateful_region/dpu/build/doca_devemu_pci_device_stateful_region_dpu \
+  -p "$DPU_DEV" \
+  -u "$EMU_VUID" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+等待 DPU 日志出现：
+
+```text
+Press ([ctrl] + c) to stop sample
+```
+
+Host 端写 stateful region：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_stateful_region/host/build/doca_devemu_pci_device_stateful_region_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -r 0 \
+    -w stateful_smoke_20260714 \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+通过条件：
+
+- Host 端打印 `Writing to stateful region ...` 并成功退出。
+- DPU 端打印 `Host wrote to stateful region of emulated device`。
+- DPU 端按 `Ctrl+c` 后打印 `Sample finished successfully`。
+
+当前不把以下现象视为失败：
+
+- DPU 端 `Printing values of stateful region ...` 后面的 dump 为全 0。
+- Host 端 read 模式读回全 0。
+
+### 5.10 devemu_pci_device_tlp_handler
+
+`devemu_pci_device_tlp_handler` 验证 DPU/BlueField 侧通过 DOCA DevEmu PCI TLP channel 处理 raw PCIe TLP，Host
+driver 通过 VFIO mmap BAR transaction region 做写入或读取。
+
+关键限制：
+
+- sample 实现单个 PCIe endpoint，只支持一个 TLP channel downstream port；运行前需要确认固件配置中 TLP ports 数量为 1。
+- DPU 端不需要 `-u <vuid>`；它会创建或复用 TLP representor。
+
+当前 transaction region 配置：
+
+```text
+bar_id=0
+start_address=0x3000
+size=4096
+```
+
+特有参数：
+
+| 参数 | 端侧 | 说明 |
+| --- | --- | --- |
+| `-s, --shm-dir-path` | DPU | 可选；TLP channel live-upgrade handover 使用的共享内存目录 |
+| `-d, --handover-destination` | DPU | 可选；作为 live-upgrade handover destination 启动 |
+| `-r, --region-index` | Host | transaction region index；当前只有 `0` |
+| `-w, --write-data` | Host | 写入 transaction region 的字符串；`-w ""` 时执行 read/dump |
+
+DPU 端先启动：
+
+```bash
+cd /root/ByteDance/doca-samples
+./samples/doca_devemu/devemu_pci_device_tlp_handler/dpu/build/doca_devemu_pci_device_tlp_handler_dpu \
+  -p "$DPU_DEV" \
+  -l 60 \
+  --sdk-log-level 40
+```
+
+等待 DPU 日志出现：
+
+```text
+Transaction region initialized: size=4096 bytes
+Expansion ROM bar region initialized: size=65536 bytes
+Polling on the TLP channel to get TLP requests. Press Ctrl+C to exit.
+```
+
+DPU 端运行期间可复查临时 TLP representor：
+
+```bash
+/opt/mellanox/doca/tools/doca_caps --list-rep-devs
+```
+
+本地实测会额外出现：
+
+```text
+representor-PCI: 0000:00:00.0
+    vuid MT2529603G38TLPPF0
+    rep_type EMULATED
+```
+
+Host 端写 transaction region：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_tlp_handler/host/build/doca_devemu_pci_device_tlp_handler_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -r 0 \
+    -w tlp_handler_smoke_20260714 \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+可选 read/dump：
+
+```bash
+$HOST_SSH "cd /root/ByteDance/doca-samples && \
+  ./samples/doca_devemu/devemu_pci_device_tlp_handler/host/build/doca_devemu_pci_device_tlp_handler_host \
+    -p $HOST_EP \
+    -g $HOST_VFIO_GROUP \
+    -r 0 \
+    -w \"\" \
+    -l 60 \
+    --sdk-log-level 40"
+```
+
+通过条件：
+
+- DPU 端进入 `Polling on the TLP channel ...`。
+- Host 端打印 `Writing to transaction region ...` 并成功退出。
+- DPU 端按 `Ctrl+c` 后清理 transaction region、Expansion ROM bar 并打印 `Sample finished successfully`。
+
+当前不把以下现象视为失败：
+
+- DPU 端 memory write handler 默认主要输出 DEBUG 级日志，INFO 级别下 Host 写入时 DPU 端可能没有额外日志。
+- Host 端 read/dump transaction region 返回全 0。本地实测写入后 read 模式仍 dump 全 0，因此只用 Host 写/读命令成功返回和
+  DPU 正常 poll/清理作为 smoke test 通过条件。
+
+### 5.11 通用常见错误
+
+| 日志/现象 | 处理方式 |
+| --- | --- |
+| DPU 端提示 `The VUID parameter is missing` | DB/DMA/stateful/MSI-X 必须通过 `-u <vuid>` 指定 emulated PCI device VUID |
+| DPU 端提示 `Matching emulated device not found` | 用 `doca_caps --list-rep-devs` 确认存在 `rep_type EMULATED` representor，且 VUID 输入正确 |
+| DPU 端提示 hotplug state 不是 `POWER_ON` | 确认 generic PCI emulated device 已被 Host 枚举且处于 power on 状态 |
+| Host 侧找不到 `15b3:1021` endpoint | 按 5.3 先运行 `devemu_pci_device_list` 枚举；若列表为空，再运行 `devemu_pci_device_hotplug` 创建 endpoint，必要时重启 Host 重新枚举 |
+| Host 端提示 `VFIO group not viable` | 确认 IOMMU group 中所有设备都已绑定到 VFIO；本地调测中 group 44 只包含 `0000:40:00.0` |
+| Host 端 `VFIO_SET_IOMMU` 返回 `errno=1` | 检查 Host `dmesg`；若提示无 interrupt remapping，可临时打开 `vfio_iommu_type1.allow_unsafe_interrupts` 做 smoke test，完成后恢复 |
+| DPU 日志出现 FLR 并重建 PCI device | Host VFIO 初始化/释放会触发 FLR，属于预期现象 |
+| 重复测试时 `drivers_probe` 或重新绑定卡住 | 清理残留 sample/probe 进程，确认 `driver_override` 已清空并恢复 `allow_unsafe_interrupts=N`；必要时重新枚举或重启 Host 后再测 |
+
+### 5.12 sample 特有错误和限制
+
+| sample | 日志/现象 | 处理方式 |
+| --- | --- | --- |
+| DB | Host 写 `-d 3` 但 DPU 监听 `-i 0` 未收到目标值 | 对 offset DB region，基础测试让 Host `--db-index` 与 DPU `--db-id` 保持一致，例如都用 `0` |
+| DMA | Host 端一直等待 DPU 写回 | 确认 DPU 端使用 `-a 0x1000000`，且 DPU 端 `-w` 写回字符串非空 |
+| DMA | DPU 端 `Failed to DMA read data from host` 或 `Failed to DMA write data to host` | 确认 Host sample 已先启动并成功映射 IOVA `0x1000000`，Host endpoint 已绑定 `vfio-pci` |
+| stateful region | Host 端提示 region index 无效 | 当前 `PCI_TYPE_NUM_BAR_STATEFUL_REGIONS` 为 1，只能使用 `-r 0` |
+| stateful region | DPU 收到事件但 dump 全 0 | 当前本地实测现象；只用事件触发作为 smoke test 通过条件 |
+| MSI-X | DPU 端提示 MSI-X index 无效 | 当前 `PCI_TYPE_NUM_MSIX` 为 4，只能使用 `0..3` |
+| MSI-X | Host 端没有收到 event | 确认 Host 监听端先启动，DPU 端 `-x` 指向合法 vector index，且 endpoint 已绑定 `vfio-pci` |
+| TLP handler | DPU 端提示 `Sample does not support TLP channel with more or less than one downstream port` | 用 `mlxconfig` 将 TLP ports 数量配置为 1 后再运行 |
+| TLP handler | Host 端 read 模式 dump 全 0 | 当前本地实测现象；只用 Host 写/读命令成功返回和 DPU 正常 poll/清理作为 smoke test 通过条件 |
+
+## 6. 后续章节模板
 
 ```text
 ## N. applications/<name> 或 samples/<group>/<name>
