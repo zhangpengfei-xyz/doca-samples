@@ -95,6 +95,159 @@ doca_devemu_pci_msix_raise();
 doca_devemu_pci_msix_destroy();
 ```
 
+### 2.1 PCI type、BAR、capability 与地址交换机制
+
+`vnet_pci_dev` 和 `vblk_pci_dev` 都把自己实现成 VirtIO PCI endpoint。DPU 侧先定义 PCI type 和
+BAR/capability 布局；Host 侧枚举设备后，按标准 PCI/VirtIO 规则读取 capability、分配 BAR 地址、写
+MSI-X table、写 VirtIO common config，并通过 doorbell MMIO 通知队列。也就是说：
+
+- **BAR 子区域、doorbell 区域、MSI-X table/PBA 区域**：主要由 DPU/PCI type 暴露给 Host，Host 枚举后知道在哪里访问。
+- **MSI-X message address/data**：Host 写入 MSI-X table，DPU 后续用 `doca_devemu_pci_ep_create_msix()` 绑定 vector，再用 `doca_devemu_pci_msix_raise()` 触发。
+- **virtqueue DMA ring 地址和队列长度**：Host 写入 VirtIO common config 的 `queue_desc`、`queue_driver`、`queue_device`、`queue_size`、`queue_msix_vector`，DPU TLP/MMIO handler 捕获这些写入并传给 `doca_devemu_virtio_vq_set_conf()`。
+- **单个 IO buffer 的 DMA 地址和长度**：不在 PCI capability 中，也不是 BAR 固定 layout 的一部分；它们由 Host 写在 virtqueue descriptor 或由 DOCA VBlk request API 暴露给 DPU 数据面。
+
+两个应用的 VirtIO BAR0 逻辑布局基本一致：
+
+| 区域 | vnet 默认 offset/size | vblk 默认 offset/size | Host 访问方式 | DPU 侧用途 |
+| --- | ---: | ---: | --- | --- |
+| VirtIO common config | `0x0000 / 0x100` | `0x0000 / 0x100` | MMIO read/write | feature 协商、device status、queue_select、queue_size、queue_msix_vector、queue_desc/driver/device |
+| ISR config | `0x0100 / 0x1` | `0x0100 / 0x1` | MMIO read | legacy ISR 状态；主路径依赖 MSI-X |
+| device config | `0x0200 / 0x100` | `0x0200 / 0x100` | MMIO read，少量设备字段 | vnet 暴露 MAC/MTU/link speed；vblk 暴露 capacity/seg_max/num_queues 等 |
+| MSI-X table | `0x2000 / 0x1000` | `0x2000 / 0x1000` | Host 写 table entry | Host 写入每个 vector 的 message address/data/mask |
+| MSI-X PBA | `0x3000 / 0x1000` | `0x3000 / 0x1000` | Host/PCIe MSI-X 机制访问 | pending bit array |
+| Doorbell / notify | `0x4000 / 0x1000` | `0x4000 / 0x1000` | Host 写 MMIO | Host notify virtqueue；vnet 使用 `notify_off_multiplier = 1 << 3`，vblk 的 type 使用 DB region 配置决定 by-offset/by-data |
+
+源码里的常量对应关系：
+
+```c
+/* vnet: applications/vnet_pci_dev/vnet_pci_device.h */
+VNET_VIRTIO_BAR_ID              = 0
+VNET_VIRTIO_BAR_LOG_SIZE        = 15    /* 32 KiB BAR */
+VNET_VIRTIO_PCI_CFG_OFFSET      = 0x0000
+VNET_VIRTIO_ISR_CFG_OFFSET      = 0x0100
+VNET_VIRTIO_DEV_CFG_OFFSET      = 0x0200
+VNET_VIRTIO_MSIX_TABLE_OFFSET   = 0x2000
+VNET_VIRTIO_MSIX_PBA_OFFSET     = 0x3000
+VNET_VIRTIO_DB_OFFSET           = 0x4000
+VNET_VIRTIO_DB_STRIDE           = 3
+
+/* vblk: applications/vblk_pci_dev/vblk_pci.h */
+VBLK_PCI_VIRTIO_BAR_ID              = 0
+VBLK_PCI_VIRTIO_BAR_LOG_SIZE        = 15
+VBLK_PCI_VIRTIO_PCI_CFG_OFFSET      = 0x0000
+VBLK_PCI_VIRTIO_ISR_CFG_OFFSET      = 0x0100
+VBLK_PCI_VIRTIO_DEV_CFG_OFFSET      = 0x0200
+VBLK_PCI_VIRTIO_MSIX_TABLE_OFFSET   = 0x2000
+VBLK_PCI_VIRTIO_MSIX_PBA_OFFSET     = 0x3000
+VBLK_PCI_VIRTIO_DB_OFFSET           = 0x4000
+VBLK_PCI_VIRTIO_DB_STRIDE           = 3
+```
+
+初始化阶段，应用先声明 PCI type 的能力和资源数量：
+
+```text
+vnet:
+  doca_devemu_vnet_pci_tlp_type_create("vnet_pci_dev", &pci_type)
+  doca_devemu_pci_type_set_num_msix(pci_type, VNET_PCI_DEV_NUM_MSIX)
+  doca_devemu_pci_type_set_num_db(pci_type, VNET_PCI_DEV_NUM_DB)
+  doca_devemu_pci_tlp_type_set_pci_cap_conf(pci_type, PCI_CAP_ID_MSIX,
+                                            offsetof(struct pcie_virtio_dev, cfg.msix_cap),
+                                            sizeof(struct msix_capability))
+
+vblk:
+  doca_devemu_vblk_pci_tlp_type_create("vblk_pci_vblk", &pci_type)
+  doca_devemu_pci_type_set_num_msix(pci_type, VBLK_PCI_VIRTIO_MAX_NUM_MSIX)
+  doca_devemu_pci_type_set_num_db(pci_type, VBLK_PCI_VIRTIO_MAX_NUM_DB)
+  doca_devemu_pci_tlp_type_set_pci_cap_conf(pci_type, PCI_CAP_ID_MSIX,
+                                            offsetof(struct pcie_virtio_dev, cfg.msix_cap),
+                                            sizeof(struct msix_capability))
+```
+
+`vnet` 使用 DOCA 预定义的 virtio-net PCI TLP type，并通过
+`doca_devemu_pci_type_create_transaction_region_info_list()`、
+`doca_devemu_pci_type_create_db_region_by_data_info_list()`、
+`doca_devemu_pci_type_create_msix_table_region_info_list()`、
+`doca_devemu_pci_type_create_msix_pba_region_info_list()` 查询实际 BAR 子区域。`vblk` 也会查询并修正
+common config、doorbell、MSI-X table/PBA capability 中的 BAR 和 offset。这样做的意义是：代码里有默认
+VirtIO layout，但最终以 DOCA PCI type/FW 暴露的 region 信息为准。
+
+Host 枚举时会读取 endpoint 的 PCI config space。DPU 的 TLP callback 根据 Host 的 config read/write
+构造 completion，并维护软件配置空间。Host 写 BAR 寄存器时，DPU 保存 Host 分配出来的 BAR base；后续
+Host 对 BAR 的 MMIO write 会带着系统物理/MMIO 地址进入 TLP channel，DPU 再减去 BAR base 得到 BAR 内
+offset：
+
+```text
+Host MMIO write address
+  -> TLP channel callback
+  -> 找到对应 endpoint
+  -> offset = mmio_addr - endpoint BAR0 base
+  -> offset 落在 common config/device config/transaction region 时进入对应 handler
+  -> offset 落在 doorbell/MSI-X 专用 region 时由 DOCA DevEmu PCI 机制处理或辅助处理
+```
+
+VirtIO capability 是 Host 和 DPU 对齐 layout 的核心。应用在 endpoint 配置空间里放置：
+
+```text
+PCI Express capability
+  -> MSI-X capability
+  -> VirtIO common_cfg capability
+  -> VirtIO notify_cfg capability
+  -> VirtIO isr_cfg capability
+  -> VirtIO device_cfg capability
+  -> VirtIO pci_cfg capability
+```
+
+其中 MSI-X capability 告诉 Host table/PBA 在哪个 BAR offset；notify capability 告诉 Host doorbell
+在何处、长度是多少、queue notify offset 如何乘以 stride；common_cfg capability 告诉 Host
+`queue_desc/queue_driver/queue_device` 这些 virtqueue 寄存器的 MMIO 位置。
+
+DMA ring 地址进入 DPU 的路径如下：
+
+```text
+Host virtio driver:
+  queue_select = qid
+  queue_size = N
+  queue_msix_vector = vector
+  queue_desc = descriptor table IOVA
+  queue_driver = avail ring IOVA
+  queue_device = used ring IOVA
+  queue_enable = 1
+
+DPU TLP/MMIO handler:
+  vnet: vnet_pci_device_pci_cfg_write32()
+  vblk: vblk_pci_virtio_pci_cfg_write32()
+  -> 更新当前 pci_cfg.vq
+  -> queue_select 切换或 queue_enable/address 完整时，把 pci_cfg.vq 同步到 dev->vqs[qid]
+  -> workqueue/OE 线程调用 doca_devemu_virtio_vq_set_conf()
+```
+
+`doca_devemu_virtio_vq_set_conf()` 的参数就是 Host 写入的 ring 元数据：
+
+```c
+doca_devemu_virtio_vq_set_conf(vq,
+                               qid,
+                               queue_size,
+                               queue_msix_vector,
+                               queue_desc,
+                               queue_driver,
+                               queue_device);
+```
+
+`queue_size` 是 ring 深度，不是数据 buffer 长度。数据 buffer 的地址和长度由 virtqueue descriptor
+表达：
+
+- 对 `vnet`，RX/TX packet buffer 的地址和长度在 virtqueue descriptor chain 中，VNet offload engine
+  根据已经配置好的 ring 地址去取 descriptor 并搬运网络包。
+- 对 `vblk`，blk request 的 header、data buffer、status buffer 同样来自 descriptor chain。DOCA
+  VBlk IO callback 已经把 Host request buffer 封装成 request/buf；应用再用 DOCA DMA 在 Host request
+  buffer 和 DPU mpool buffer 之间 memcpy。
+
+MSI-X 的方向和 DMA ring 相反：Host 先通过 MSI-X table 告诉设备“中断写到哪里”，DPU 再按 Host 选择的
+vector 发中断。vnet 的配置变更 MSI-X 路径会读取 `pci_cfg->config_msix_vector`，如果 vector 变化就重建
+`doca_devemu_pci_msix` 对象，然后 `doca_devemu_pci_msix_raise()`。vblk 的 `vblk_pci_notify_host()` 也是同样
+模式。hotplug bridge 事件另有一条路径：代码会解析 bridge MSI capability 中 Host 写入的
+`message_address_low/high` 和 `message_data`，再通过 ACG credit 手工构造 Memory Write TLP。
+
 ## 3. vnet_pci_dev 主干流程
 
 `vnet_pci_dev` 在 DPU 侧暴露 VirtIO Net endpoint。它的主干特征是：endpoint 创建阶段只准备 PCI/TLP 设备和 VNet offload engine；RX/TX VQ、CVQ、IO context 和 engine enable 都由 Host virtio-net driver 的

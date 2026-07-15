@@ -627,3 +627,578 @@ Host 写 mmap 后，DPU 侧由 DevEmu SDK 触发 stateful write event；DPU 不�
 6. DMA 不通：确认 Host 已 `VFIO_IOMMU_MAP_DMA` 到 DPU 使用的同一 IOVA；DPU 端 remote mmap 的地址和长度必须覆盖 Host buffer。
 7. TLP handler 不响应：确认当前进程是 channel owner，`doca_pe_progress()` 在跑；TLP channel downstream port 数量必须为 1。
 8. Stateful event 不触发：确认 DPU 已注册 stateful region write event 且 ctx 已 start；Host 写入的是 stateful region 而不是 transaction region。
+
+## 11. 未来扩展设计：VFIO Admin Queue 抽象设备
+
+本节是未来扩展设计，不是当前 `samples/doca_devemu` 已实现的 sample 功能。目标是实现一个可复用的
+VFIO-only 抽象设备：Host 设备绑定 `vfio-pci`，Host userspace 自己完成 BAR mmap、DMA map、MSI-X
+eventfd 绑定、doorbell 写入和协议解析；DPU 侧拆成 `pci-fe` 和 `dev-be` 两个程序。
+
+推荐采用 hotplug 托管模型，而不是让 `pci-fe` 代理所有数据面：
+
+- `pci-fe`：PCI frontend/provisioning daemon，常驻运行，负责创建、清理和维护 Host 可见的 emulated PCI
+  endpoint。它配置 BAR/DB/MSI-X/stateful/admin region layout，hotplug 设备，发布 VUID/BDF/layout/generation，
+  并在退出时协调安全 hot-unplug。正常运行期它不创建 DB/MSI-X/DMA runtime object，也不处理业务 doorbell。
+- `dev-be`：device backend/datapath owner，按需启动和退出。它读取 `pci-fe` 发布的 VUID/layout，attach 到已有
+  endpoint，实际创建 DB completion、DB object、MSI-X object、DMA context/remote mmap，实际响应 Host DB、发出
+  MSI-X、发起 DMA read/write，并实现 admin queue opcode。
+
+这个拆分更接近 `db/msix/dma/stateful_region` sample 的模型：设备可以先由 hotplug/provisioning 程序创建出来，
+后续业务程序再通过 VUID 找到已有 representor 并接管 datapath。代价是：`dev-be` 不在时，Host 业务 command
+不会有 DPU completion，Host userspace 必须有 timeout/retry；`pci-fe` 不承诺替 `dev-be` 返回
+`BACKEND_DOWN` completion。
+
+### 11.1 总体分层
+
+```text
+Host userspace VFIO driver
+  -> 等待 emulated PCI device 存在并绑定 vfio-pci
+  -> VFIO 初始化、BAR mmap、MSI-X eventfd、DMA map/unmap
+  -> 在 admin/stateful region 写 cmd/rsp IOVA、length、MSI-X vector、queue_enable
+  -> 写 DB region 提交 command
+  -> 收 MSI-X 或按 timeout poll response buffer
+
+DPU pci-fe
+  -> 常驻，负责 provisioning/lifecycle
+  -> 创建/start PCI type，配置 BAR/DB/MSI-X/PBA/stateful region
+  -> 创建或清理 emulated endpoint，保证 Host 能枚举设备
+  -> 发布 VUID、BDF、BAR layout、DB/MSI-X/stateful region、generation
+  -> 正常运行期不持有 datapath owner，不处理业务 DB/MSI-X/DMA
+  -> 退出时先协调 dev-be 停止，再 hot-unplug/destroy endpoint
+
+DPU dev-be
+  -> 读取 pci-fe 发布的 VUID/layout/generation
+  -> 创建同名/同配置 PCI type，用 VUID find_emulated_device()
+  -> doca_devemu_pci_dev_create() attach 到已有 endpoint
+  -> 创建 DB completion/DB object，创建 MSI-X object，创建 DMA context/remote mmap
+  -> 从 admin/stateful region 获取 Host 发布的 IOVA/length/vector
+  -> 收 DB 后 DMA 读 command、执行业务、DMA 写 response、raise MSI-X
+```
+
+第一版只做一个 admin queue，不做完整 virtqueue descriptor ring。这样可以先验证 hotplug 托管、VFIO BAR mmap、
+stateful/admin 配置区、DB、MSI-X、DMA 的闭环，避免一开始就处理 descriptor chain、used ring、available ring、
+indirect descriptor、reset race 和标准 VirtIO driver 兼容等复杂度。
+
+### 11.2 程序边界与所有权
+
+`pci-fe` 和 `dev-be` 的边界必须围绕 DOCA object owner 设计。`pci-fe` 只拥有 provisioning/lifecycle 对象；
+`dev-be` 是 runtime datapath owner。
+
+```text
+pci-fe owns:
+  PCI type provisioning config
+  endpoint creation/removal intent
+  emulated endpoint lifecycle metadata
+  published VUID/BDF/layout/generation file
+  optional lifecycle IPC with dev-be
+
+pci-fe should not own during normal datapath:
+  doca_devemu_pci_dev runtime ctx
+  DB completion / DB object
+  MSI-X object
+  DMA context / remote mmap / buf inventory
+  command inflight state
+
+dev-be owns:
+  opened representor for the published VUID
+  doca_devemu_pci_dev runtime ctx
+  DB completion / DB object
+  MSI-X object
+  DMA context / remote mmap / buf inventory
+  admin queue runtime state
+  opcode implementation and business resources
+```
+
+`pci-fe` 创建 endpoint 后，应避免长期持有会阻止 `dev-be` attach 的 runtime handle。可行做法是：`pci-fe` 创建
+representor/hotplug endpoint 后，只保留生命周期元数据；如果 SDK 要求打开 representor 才能创建 endpoint，创建完成后应
+close representor 而不是 destroy representor。`dev-be` 再按 VUID 打开同一个 representor 并创建
+`doca_devemu_pci_dev`。
+
+`pci-fe` 与 `dev-be` 的 attach 规则如下：
+
+- `pci-fe` 可以常驻并保持 PCI type started，同时发布 VUID/layout/generation。
+- `dev-be` 自己创建同名同配置 PCI type，通过 rep list 找到 `pci-fe` 发布的 VUID，打开 representor，并独占创建
+  `doca_devemu_pci_dev` runtime ctx。
+- 同一 VUID 只能有一个已 start 的 `doca_devemu_pci_dev` ctx。`pci-fe` 不应长期持有该 ctx，也不应创建
+  DB/MSI-X/DMA runtime object。
+- 第一版不需要把 `pci-fe` 降级为短生命周期 provisioning step，也不需要由 `pci-fe` 代理 attach/query API。
+
+`pci-fe` 与 `dev-be` 可以保留一个很小的 lifecycle IPC，但不走 per-command 数据面：
+
+```text
+DEV_BE_REGISTER(pid, generation, vuid)
+DEV_BE_READY(runtime_feature_bits)
+DEV_BE_QUIESCE_REQUEST(reason)
+DEV_BE_QUIESCE_DONE()
+DEV_BE_EXITING()
+HEARTBEAT(generation)
+```
+
+该 IPC 只用于启动顺序、健康检查和安全关停，不传 command payload，不代理 DMA。
+
+### 11.3 pci-fe 发布的设备描述
+
+`pci-fe` 创建或发现 endpoint 后，向本地文件或 Unix socket 发布设备描述。`dev-be` 和运维脚本以它为准，不在源码里硬编码
+VUID/BDF。
+
+```json
+{
+  "name": "adminq0",
+  "generation": 12,
+  "vuid": "...",
+  "host_bdf": "0000:48:00.0",
+  "type_name": "adminq",
+  "bar": 0,
+  "bar_log_size": 14,
+  "db_region_index": 0,
+  "db_region_offset": 0,
+  "db_region_size": 4096,
+  "db_index": 0,
+  "msix_table_offset": 4096,
+  "msix_pba_offset": 8192,
+  "num_msix": 4,
+  "admin_region_offset": 12288,
+  "admin_region_size": 256
+}
+```
+
+建议带 `generation`。`pci-fe` 每次重新创建 endpoint 都递增 generation；`dev-be` attach 后如果发现 generation 变化，必须
+销毁 runtime object 并重新 attach。Host userspace 也可以把 generation 写入 command header，避免使用旧设备残留状态。
+
+### 11.4 PCI/BAR layout
+
+如果使用普通 DevEmu hotplug 托管模型，优先沿用现有 sample 的 16 KiB BAR0，减少未知数：
+
+| BAR0 offset | size | 名称 | Host 访问 | `pci-fe` 处理 | `dev-be` 处理 |
+| ---: | ---: | --- | --- | --- | --- |
+| `0x0000` | `0x1000` | DB / doorbell region | MMIO write | 配置 region | 创建 DB object，收 Host doorbell |
+| `0x1000` | `0x1000` | MSI-X table | VFIO/MSI-X | 配置 region | 创建 MSI-X object 并 raise vector |
+| `0x2000` | `0x1000` | MSI-X PBA | VFIO/MSI-X | 配置 region | 由 MSI-X 机制使用 |
+| `0x3000` | `0x100` 或 `0x1000` | admin/stateful config region | MMIO write/read mmap | 配置 stateful/admin region | query Host 写入的 IOVA/len/vector/queue_enable |
+
+如果后续需要 vnet/vblk 风格的 `0x4000` notify window，可以把 BAR0 扩到 32 KiB：
+
+| BAR0 offset | size | 名称 | 用途 |
+| ---: | ---: | --- | --- |
+| `0x0000` | `0x100` | future common/admin window | 仅 TLP mode 下可做动态 MMIO read/write |
+| `0x1000` | `0x1000` | MSI-X table | Host 写 vector message address/data |
+| `0x2000` | `0x1000` | MSI-X PBA | pending bit array |
+| `0x3000` | `0x1000` | admin/stateful config region | Host 发布 queue DMA config |
+| `0x4000` | `0x1000` | DB / notify | Host doorbell |
+
+普通托管路径下，不要假设 DPU 可以像 TLP handler 那样任意响应 BAR MMIO read completion。Host->DPU 的配置通道应使用
+stateful/admin region；DPU->Host 的完成状态应写入 Host DMA response buffer，并通过 MSI-X 通知 Host。
+
+### 11.5 Capability 与 PCI type
+
+第一版建议使用 vendor-specific PCI device ID。普通 DevEmu 托管路径如果不能配置任意 vendor-specific capability，
+就不要依赖 capability 发现 admin layout，而是依赖 `pci-fe` 发布的 layout 文件和 Host/DPU 共享头文件。
+
+不要暴露 `1af4` VirtIO vendor/device ID，也不要暴露完整 VirtIO PCI capability chain 给 Host 内核 `virtio-pci`
+driver。标准 virtio driver 一旦绑定，就会执行 feature negotiation、common_cfg 读写、queue setup 和 device_status
+状态机；普通 hotplug 托管路径不能等价实现 vnet/vblk 那类动态 VirtIO PCI MMIO/TLP 语义。
+
+实现选择分两档：
+
+```text
+VFIO admin queue v1:
+  普通 DevEmu PCI type
+  vendor-specific PCI device ID
+  fixed BAR/DB/MSI-X/stateful layout
+  pci-fe creates/provisions endpoint
+  dev-be owns DB/MSI-X/DMA runtime
+  Host 只绑定 vfio-pci
+
+Future VirtIO PCI:
+  TLP type
+  pci-fe 完整响应 Host config/MMIO TLP
+  暴露标准 VirtIO PCI capability chain
+  支持 Linux virtio-pci 原生 probe
+```
+
+标准 VirtIO PCI 能力只作为未来扩展预留，不在第一版 Host-visible config space 中启用。可以在发布文件或私有协议里记录：
+
+```text
+ADMINQ_F_FUTURE_VIRTIO_PCI_RESERVED = 1
+ADMINQ_F_STANDARD_VIRTIO_PCI_ENABLED = 0
+```
+
+### 11.6 Admin/stateful config region
+
+普通托管路径下，BAR 内 admin region 更适合作为 Host 写给 DPU 的配置结构，而不是 TLP 动态寄存器。Host 通过 VFIO mmap
+该 region，写入 queue DMA 地址、长度、MSI-X vector 和 enable 位；`dev-be` 通过 stateful write event 或 query API
+读取这些值。
+
+```c
+#define ADMINQ_MAGIC 0x41445130u /* "ADQ0" */
+
+struct adminq_host_cfg {
+    uint32_t magic;              /* Host writes ADMINQ_MAGIC */
+    uint16_t version_major;
+    uint16_t version_minor;
+    uint32_t generation;         /* Must match pci-fe published generation */
+
+    uint64_t cmd_iova;           /* Host DMA IOVA of command buffer */
+    uint32_t cmd_len;            /* command buffer length */
+    uint32_t cmd_stride;         /* one command slot size, v1 may equal cmd_len */
+
+    uint64_t rsp_iova;           /* Host DMA IOVA of response buffer */
+    uint32_t rsp_len;            /* response buffer length */
+    uint32_t rsp_stride;         /* one response slot size */
+
+    uint16_t msix_vector;        /* completion MSI-X vector */
+    uint16_t queue_enable;       /* 0/1 */
+    uint32_t producer_seq;       /* Host updates before DB */
+    uint32_t flags;
+};
+```
+
+不要把 `consumer_seq`、`last_status` 这类 DPU 更新字段放在普通托管 BAR register 语义里作为第一版依赖。完成状态放在
+response DMA buffer 中：
+
+```c
+struct adminq_rsp_hdr {
+    uint32_t seq;
+    uint32_t status;
+    uint32_t actual_output_len;
+    uint32_t reserved;
+};
+```
+
+如果后续切到 TLP mode，才可以把 `consumer_seq`、`last_status`、`backend_status` 做成真正由 `pci-fe` 或 `dev-be`
+动态返回的 MMIO read register。
+
+### 11.7 Command/response buffer
+
+Host 通过 VFIO 分配并映射 DMA buffer。v1 固定为“一次一个 command”，不做 ring：
+
+```c
+struct adminq_cmd_hdr {
+    uint32_t opcode;
+    uint32_t flags;
+    uint32_t seq;
+    uint32_t input_len;
+    uint32_t output_len;
+    uint32_t generation;
+};
+
+enum adminq_cmd_status {
+    ADMINQ_STATUS_OK = 0,
+    ADMINQ_STATUS_INVALID = 1,
+    ADMINQ_STATUS_BACKEND_NOT_READY = 2,
+    ADMINQ_STATUS_TIMEOUT = 3,
+    ADMINQ_STATUS_IO_ERROR = 4,
+    ADMINQ_STATUS_GENERATION_MISMATCH = 5,
+};
+```
+
+Host 写入 command buffer：
+
+```text
+cmd_iova -> adminq_cmd_hdr + payload
+rsp_iova -> adminq_rsp_hdr + payload space
+```
+
+`dev-be` 收 DB 后：
+
+```text
+query/read adminq_host_cfg from stateful/admin region
+validate magic/version/generation/queue_enable/cmd_iova/rsp_iova/len/vector
+create/update remote mmap if Host config changed
+DMA read cmd_iova, cmd_len
+validate cmd.seq, cmd.input_len, cmd.output_len, cmd.generation
+execute opcode
+DMA write rsp_iova, rsp_len
+ensure MSI-X object for msix_vector
+raise MSI-X
+```
+
+如果 `dev-be` 不在，Host 写 DB 不会得到 completion。Host userspace 必须给 command 等待设置 timeout；timeout 后可以重试
+`GET_STATUS`/`NOP` 类 command，或要求运维先启动 `dev-be`。
+
+后续要扩展吞吐时，再把 `cmd_iova/rsp_iova` 改成 ring base，增加 `queue_size`、`head/tail`、slot stride；这一步再接近
+VirtIO virtqueue。
+
+### 11.8 Host VFIO 流程
+
+Host userspace 初始化流程：
+
+```text
+wait device exists and is bound to vfio-pci
+init_vfio_device()
+  -> open /dev/vfio/vfio
+  -> open /dev/vfio/<group>
+  -> VFIO_GROUP_SET_CONTAINER
+  -> VFIO_SET_IOMMU(VFIO_TYPE1v2_IOMMU)
+  -> VFIO_GROUP_GET_DEVICE_FD
+  -> enable PCI command: memory space + bus master
+
+map BAR0 admin/stateful region and DB region
+  -> VFIO_DEVICE_GET_REGION_INFO(VFIO_PCI_BAR0_REGION_INDEX)
+  -> mmap admin/stateful region
+  -> mmap DB region
+
+setup MSI-X
+  -> VFIO_DEVICE_GET_IRQ_INFO(VFIO_PCI_MSIX_IRQ_INDEX)
+  -> eventfd(EFD_NONBLOCK)
+  -> VFIO_DEVICE_SET_IRQS(vector -> eventfd)
+
+setup DMA
+  -> mmap anonymous or hugepage memory for cmd/rsp
+  -> VFIO_IOMMU_MAP_DMA(cmd_iova, cmd_len)
+  -> VFIO_IOMMU_MAP_DMA(rsp_iova, rsp_len)
+
+publish queue
+  -> write adminq_host_cfg: magic/generation/cmd_iova/cmd_len/rsp_iova/rsp_len/msix_vector
+  -> store barrier
+  -> write queue_enable = 1
+```
+
+提交 command：
+
+```text
+fill command buffer
+store barrier
+write producer_seq in adminq_host_cfg
+MMIO write DB offset: value = producer_seq or qid
+poll eventfd with timeout
+read response buffer and validate seq/status/generation
+```
+
+Host 侧必须把设备绑定到 `vfio-pci`。如果绑定到内核功能驱动，userspace 就无法直接 mmap BAR 和管理 MSI-X/DMA。
+Host 程序可以早于 `dev-be` 启动，但提交 command 必须有 timeout；如果 `dev-be` 尚未 attach DB，就不会有 MSI-X completion。
+普通托管路径下，Host 不应依赖 BAR read 观察 DPU 进度；completion 以 response DMA buffer 和 MSI-X/eventfd 为准。
+
+### 11.9 pci-fe 流程
+
+`pci-fe` 启动流程：
+
+```text
+take singleton lock
+open DOCA dev
+create PE if provisioning API requires it
+create PCI type
+configure vendor/device/class
+configure BAR layout
+configure DB region
+configure MSI-X table/PBA region
+configure stateful/admin region
+start PCI type
+cleanup stale endpoint owned by previous generation
+create endpoint / representor / hotplug device
+publish VUID/BDF/layout/generation
+close runtime handles that would block dev-be attach, but do not destroy endpoint
+monitor lifecycle IPC / signals
+```
+
+启动时总清理旧残留是正确方向，但不能把“强制 destroy”作为第一步。建议用 owner tag/generation 识别旧设备：
+
+```text
+if stale endpoint belongs to this pci-fe:
+  ask dev-be to quiesce if it is running
+  wait dev-be close/destroy runtime objects with timeout
+  hot-unplug or destroy old representor
+  wait Host remove/ack with timeout
+  force cleanup only after timeout
+create endpoint with new generation
+```
+
+如果 Host 正在启动或正在枚举，强制清理仍可能造成 AER 或 completion timeout。因此生产流程应尽量让 `pci-fe` 在 Host
+power cycle 前启动完成；异常恢复时才走 timeout 后 force cleanup。
+
+`pci-fe` 正常运行期主要做 health/lifecycle 工作：
+
+```text
+serve /run/devemu-adminq/adminq0.json
+watch dev-be heartbeat if lifecycle IPC is enabled
+on SIGTERM:
+  ask dev-be quiesce
+  wait dev-be done or timeout
+  hot-unplug endpoint
+  destroy provisioning objects
+```
+
+### 11.10 dev-be 流程
+
+`dev-be` 前置条件是 `pci-fe` 已创建 emulated PCI endpoint 并发布 VUID/layout。`dev-be` 是真正 datapath owner。
+
+```text
+read /run/devemu-adminq/adminq0.json
+open DOCA dev
+create PE
+create same-name/same-config PCI type
+start PCI type
+find_emulated_device(vuid)
+open representor
+doca_devemu_pci_dev_create()
+register FLR/stateful write callbacks
+start pci_dev ctx
+wait ctx RUNNING / hotplug state POWER_ON
+create DB completion and DB object
+create DMA context / buf inventory / local buffers
+mark dev-be READY in lifecycle IPC or log
+main loop: progress PE + DB/DMA completions
+```
+
+DB path：
+
+```text
+DB completion arrives
+  -> read DB value / producer_seq
+  -> query admin/stateful config
+  -> validate generation and queue_enable
+  -> update remote mmap if cmd/rsp IOVA changed
+  -> submit DMA read command
+  -> execute opcode
+  -> submit DMA write response
+  -> raise MSI-X
+```
+
+MSI-X object 可以在 queue enable 时创建，也可以在第一次 completion 前 lazy create：
+
+```text
+if msix == NULL or cached_vector != cfg.msix_vector:
+    destroy old msix
+    doca_devemu_pci_ep_create_msix(pci_ep, BAR0, MSIX_TABLE_OFFSET,
+                                   cfg.msix_vector, &msix)
+doca_devemu_pci_msix_raise(msix)
+```
+
+`dev-be` 崩溃或退出时，Host 可见设备仍由 `pci-fe` 保持存在；但业务 DB 不会被消费。Host userspace 应 timeout，
+并在 `dev-be` 恢复后重新发布 queue config 或重新提交 command。
+
+### 11.11 状态机、reset 与关停
+
+设备级状态由 `pci-fe` 维护在本地元数据中，不要求 Host 通过 BAR 动态读取：
+
+```text
+ABSENT
+  -> pci-fe start
+  -> PRESENT_NO_BE
+  -> PRESENT_BE_ATTACHED
+  -> QUIESCING
+  -> UNPLUGGING
+  -> ABSENT
+```
+
+queue/runtime 状态由 `dev-be` 维护：
+
+```text
+DETACHED
+  dev-be attach VUID and ctx RUNNING
+  -> ATTACHED
+
+ATTACHED
+  Host 写 adminq_host_cfg.queue_enable=1 且 IOVA/len/vector 合法
+  -> CONFIGURED
+
+CONFIGURED
+  dev-be remote mmap 创建成功
+  -> RUNNING
+
+RUNNING
+  Host DB
+  -> BUSY
+
+BUSY
+  DMA/read/execute/write/MSI-X 完成
+  -> RUNNING
+
+任意状态:
+  Host FLR 或 generation mismatch
+  -> 停止接收新 DB
+  -> drain 或取消 in-flight DMA
+  -> destroy msix/mmap/DB runtime state
+  -> ATTACHED 或 DETACHED
+```
+
+`dev-be` 正常退出：
+
+```text
+dev-be:
+  stop accepting new DB
+  wait current command done or timeout
+  destroy DB object / DB completion
+  destroy MSI-X object
+  destroy DMA remote mmap / context / buf inventory
+  stop/destroy pci_dev ctx
+  close representor
+  notify pci-fe lifecycle IPC if enabled
+  exit
+
+pci-fe:
+  keep endpoint present
+  mark local metadata as PRESENT_NO_BE
+```
+
+`pci-fe` 正常退出才负责安全移除设备，顺序必须先停 `dev-be`：
+
+```text
+pci-fe:
+  ask dev-be to quiesce
+  wait dev-be done or timeout
+  if timeout: record forced cleanup and continue carefully
+  hot-unplug endpoint
+  destroy representor/provisioning objects
+  exit
+```
+
+等待 Host 或 `dev-be` 确认必须有超时。Host 可能已经重启、Host VFIO app 可能崩溃，或 `dev-be` 可能已经异常退出。
+超时后 `pci-fe` 应进入 forced unplug/cleanup，并记录 generation，下一次启动继续识别和清理 stale endpoint。
+
+FLR、hot-unplug、Host unmap DMA 时必须让 `dev-be` 缓存的 IOVA 失效。Host 应先写 `queue_enable=0`，等待当前
+command completion 或 timeout，再 `VFIO_IOMMU_UNMAP_DMA`。`dev-be` 如果在 BUSY 状态收到 FLR/reset，应拒绝后续 DB，
+取消未开始的 DMA，并销毁 remote mmap/MSI-X runtime state。
+
+### 11.12 内存顺序和确认
+
+Host 提交 command 的顺序：
+
+```text
+写 command buffer
+store barrier
+写 producer_seq 到 adminq_host_cfg
+store/MMIO barrier
+MMIO write DB
+```
+
+`dev-be` 完成 command 的顺序：
+
+```text
+DMA write response buffer
+确认 DMA completion
+raise MSI-X
+```
+
+Host 收到 MSI-X 后仍应读取 response header 校验 `seq/status/generation`，不要只依赖 eventfd 次数判断完成。eventfd
+只表示有中断，不携带 command id。Host 超时后不能假设 command 没被执行；第一版应把 opcode 设计成可重试或带 seq 去重。
+
+### 11.13 第一版边界
+
+第一版建议只支持：
+
+- `pci-fe` + `dev-be` 两进程，`pci-fe` 是 provisioning/lifecycle owner，`dev-be` 是 datapath owner。
+- 1 个 admin queue。
+- 1 个 in-flight command。
+- 固定 command/response buffer 长度，例如 4 KiB。
+- 1 个 MSI-X vector。
+- doorbell value 只携带 `producer_seq` 或固定 `qid=0`。
+- Host/DPU 共享同一个协议头文件，layout 固定。
+- `pci-fe` 发布 VUID/BDF/layout/generation；`dev-be` 按 VUID attach。
+- `dev-be` 实际创建并使用 DB/MSI-X/DMA runtime object。
+
+暂时不做：
+
+- `pci-fe` 代理业务 DB、MSI-X 或 DMA。
+- `pci-fe` 代替 `dev-be` 返回 `BACKEND_DOWN` completion。
+- 标准 VirtIO PCI endpoint 暴露。
+- Linux `virtio-pci` / `virtio-net` / `virtio-blk` driver 兼容。
+- 完整 VirtIO descriptor ring。
+- 多 queue。
+- indirect descriptor。
+- packed ring。
+- live update/handover。
+
+这样可以把风险集中在五件事：`pci-fe` 是否能稳定创建和清理 Host 可见 PCI endpoint，`dev-be` 是否能可靠 attach
+已有 VUID，VFIO BAR/DB/MSI-X 是否按 layout 工作，IOVA 是否能被 `dev-be` 通过 DOCA DMA 访问，Host timeout/retry
+是否能覆盖 `dev-be` 不在或崩溃的窗口。
