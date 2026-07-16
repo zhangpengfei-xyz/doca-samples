@@ -533,9 +533,372 @@ $HOST_SSH "lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL /dev/vda"
 | 写入 `/dev/vda` 后读回内容不一致 | 当前样例读写后端仍是占位实现，这是预期限制；只用 direct read/write 成功返回作为 smoke test |
 | `--provider DPA` 初始化失败 | 改用 `--provider DPU` 复测，并保留完整 DOCA 日志继续定位 |
 
-## 5. samples/doca_devemu generic PCI samples
+## 5. applications/nvme_emulation
 
-### 5.1 适用范围与公共约定
+### 5.1 概述
+
+`applications/nvme_emulation` 在 DPU 侧运行 SPDK target，并通过 DOCA DevEmu PCI Generic API 创建 NVMe PCIe
+function。Host 侧会在线枚举为 NVMe 控制器和块设备。
+
+关键规则：
+
+- DPU 端运行 `doca_nvme_emulation` 后，后续配置通过 SPDK RPC 完成。
+- DOCA 相关 RPC 由 `applications/nvme_emulation/rpc_nvmf_doca.py` 提供，调用 `spdk_rpc.py` 时需要设置
+  `PYTHONPATH` 并加载 `--plugin rpc_nvmf_doca`。
+- 当前 100GbE 本地环境已有 1GB hugepage mount `/dev/hugepages`；启动参数应使用 `--huge-dir /dev/hugepages`。
+- Host 侧基础 I/O 测试只操作新枚举的 64MB malloc 后端测试盘，不要误写真实 NVMe 盘。
+- 正常清理顺序是：Host 先移除 PCI function，DPU 再 remove listener，确认 QP 归零后再 destroy function、
+  delete subsystem/bdev，最后停止 target。不要在 Host NVMe controller 还活着时直接 destroy function。
+
+### 5.2 参数与变量
+
+`doca_nvme_emulation` 使用标准 SPDK app 参数，DOCA emulation manager、function 和 listener 通过 RPC 配置。
+
+| 参数/变量 | 说明 |
+| --- | --- |
+| `-m` | SPDK/DPDK core mask；基础测试使用 `0x3` |
+| `-s` | DPDK memory size，单位 MB；基础测试使用 `1024` |
+| `--huge-dir` | hugetlbfs mount；当前本地调测使用 `/dev/hugepages` |
+| `-r` | SPDK RPC socket；建议使用 `/var/tmp/doca_nvme.sock` |
+| `DEV_NAME` | DOCA emulation manager 名称；当前 100GbE 本地调测为 `mlx5_bond_0` |
+| `NQN` | SPDK NVMe-oF subsystem NQN；示例使用 `nqn.2016-06.io.spdk:cnode1` |
+| `VUID` | `nvmf_doca_create_function` 返回的 emulated function 标识，后续作为 DOCA listener 地址 |
+
+### 5.3 启动前检查
+
+DPU 侧确认没有残留 target 进程和旧 SPDK RPC socket：
+
+```bash
+ps -eo pid,ppid,stat,comm,args | grep '[d]oca_nvme_emulation' || true
+rm -f /var/tmp/doca_nvme.sock
+/opt/mellanox/doca/tools/doca_caps --list-rep-devs
+```
+
+Host 侧确认没有前次 emulated NVMe 残留：
+
+```bash
+$HOST_SSH "sh -c 'lspci -Dnn | egrep -i \"15b3:6001|NVMe SNAP\" || true; \
+  ls -l /dev/nvme2 /dev/nvme2n1 2>/dev/null || true;"
+```
+
+干净状态下，Host 不应看到 `15b3:6001` 或 `/dev/nvme2n1`。
+
+### 5.4 启动 target
+
+DPU 端需要让 `doca_nvme_emulation` 在整个 Host 枚举和 I/O 测试期间持续运行。推荐使用 `setsid` 做长时间/非交互
+运行：进程脱离当前 shell/session，stdin 绑定 `/dev/null`，stdout/stderr 写入日志文件。
+
+不要只用普通 `cmd &` 后台运行；shell/SSH 退出时进程可能收到 `SIGHUP`，造成 target 退出但 socket 文件残留。
+
+```bash
+cd /root/ByteDance/doca-samples
+mkdir -p /tmp/doca_nvme_run
+rm -f /var/tmp/doca_nvme.sock /tmp/doca_nvme_run/doca_nvme.log /tmp/doca_nvme_run/doca_nvme.pid
+
+setsid ./applications/build/nvme_emulation/doca_nvme_emulation \
+  -m 0x3 \
+  -s 1024 \
+  --huge-dir /dev/hugepages \
+  -r /var/tmp/doca_nvme.sock \
+  -L nvmf \
+  -L bdev \
+  -L nvme \
+  </dev/null >/tmp/doca_nvme_run/doca_nvme.log 2>&1
+
+echo $! > /tmp/doca_nvme_run/doca_nvme.pid
+```
+
+后台启动后检查进程、socket 和日志：
+
+```bash
+cat /tmp/doca_nvme_run/doca_nvme.pid
+ps -p "$(cat /tmp/doca_nvme_run/doca_nvme.pid)" -o pid,ppid,stat,comm,args
+ss -xl | grep doca_nvme
+tail -80 /tmp/doca_nvme_run/doca_nvme.log
+```
+
+启动日志中可能出现如下 mlx5 accel 初始化错误：
+
+```text
+Failed to create PSV memory pool
+Failed to init accel module mlx5, ignoring it
+```
+
+只要 SPDK reactor 继续运行、RPC socket 监听正常，这个错误不影响本节基础 NVMe emulation smoke test。
+
+另开 DPU 终端设置 SPDK_RPC 变量并检查连通性：
+
+```bash
+cd /root/ByteDance/doca-samples
+
+SPDK_RPC='env PYTHONPATH=/root/ByteDance/doca-samples/applications/nvme_emulation /usr/bin/spdk_rpc.py -s /var/tmp/doca_nvme.sock --plugin rpc_nvmf_doca'
+
+$SPDK_RPC spdk_get_version
+$SPDK_RPC framework_get_reactors
+$SPDK_RPC nvmf_doca_get_managers
+```
+
+期望 `nvmf_doca_get_managers` 输出包含：
+
+```json
+[
+  {
+    "name": "mlx5_bond_0"
+  }
+]
+```
+
+### 5.5 SPDK RPC 配置 NVMe 设备
+
+变量约定：
+
+```bash
+NQN='nqn.2016-06.io.spdk:cnode1'
+DEV_NAME='mlx5_bond_0'
+```
+
+创建 DOCA transport、64MB malloc bdev、subsystem 和 namespace：
+
+```bash
+$SPDK_RPC nvmf_create_transport -t doca
+$SPDK_RPC bdev_malloc_create 64 512 -b Malloc0
+$SPDK_RPC nvmf_create_subsystem "$NQN" -a -s DOCA000000000001
+$SPDK_RPC nvmf_subsystem_add_ns "$NQN" Malloc0
+```
+
+创建 emulated function，并记录返回的 VUID：
+
+```bash
+$SPDK_RPC nvmf_doca_create_function -d "$DEV_NAME"
+```
+
+本地 100GbE 调测返回示例：
+
+```json
+{
+  "Created a function with vuid": "MT2529603G38GES2D0F0"
+}
+```
+
+将该 VUID 作为 listener 地址执行 hotplug：
+
+```bash
+VUID=MT2529603G38GES2D0F0
+
+$SPDK_RPC nvmf_subsystem_add_listener "$NQN" -t doca -a "$VUID"
+$SPDK_RPC nvmf_doca_list_functions -d "$DEV_NAME"
+$SPDK_RPC nvmf_get_subsystems
+```
+
+本地 100GbE 调测中，`nvmf_doca_list_functions` 输出包含：
+
+```json
+[
+  {
+    "Function VUID: ": "MT2529603G38GES2D0F0",
+    "PCI Address: ": "0000:41:00.0"
+  }
+]
+```
+
+`nvmf_get_subsystems` 中应看到 `transport/trtype` 为 `DOCA`，`traddr` 为上面的 VUID，namespace 后端为 `Malloc0`。
+
+### 5.6 Host 侧校验与 fio
+
+Host 侧检查新 PCI 设备。100GbE 本地调测中，emulated NVMe endpoint 为 `0000:41:00.0`：
+
+```bash
+$HOST_SSH "lspci -Dnnk -s 0000:41:00.0"
+```
+
+期望输出包含：
+
+```text
+0000:41:00.0 Non-Volatile memory controller [0108]: Mellanox Technologies NVMe SNAP Controller [15b3:6001]
+Kernel driver in use: nvme
+```
+
+Host 侧检查块设备：
+
+```bash
+$HOST_SSH "nvme list"
+$HOST_SSH "blockdev --getsize64 /dev/nvme2n1"
+$HOST_SSH "lsblk /dev/nvme2n1"
+```
+
+本地 100GbE 调测结果：
+
+```text
+/dev/nvme2n1  DOCA000000000001  SPDK bdev Controller  67.11 MB / 67.11 MB
+67108864
+```
+
+做 identify 检查：
+
+```bash
+$HOST_SSH "nvme id-ctrl /dev/nvme2 | head -80"
+$HOST_SSH "nvme id-ns /dev/nvme2n1 | head -80"
+```
+
+期望关键信息：
+
+- controller serial number 为 `DOCA000000000001`。
+- model 为 `SPDK bdev Controller`。
+- `subnqn` 为 `nqn.2016-06.io.spdk:cnode1`。
+- namespace `nsze/ncap/nuse` 为 `0x20000`，对应 64MB、512B block。
+
+使用 `fio` 做 32MB raw block 写入和校验读，只操作新枚举的 `/dev/nvme2n1`：
+
+```bash
+$HOST_SSH "fio \
+  --name=doca_nvme_fio_verify \
+  --filename=/dev/nvme2n1 \
+  --direct=1 \
+  --ioengine=libaio \
+  --rw=write \
+  --bs=4k \
+  --iodepth=8 \
+  --numjobs=1 \
+  --size=32M \
+  --verify=crc32c \
+  --do_verify=1 \
+  --verify_fatal=1 \
+  --group_reporting"
+```
+
+期望 `fio` 返回 `err=0`，并看到读写各 32MiB。100GbE 本地调测示例：
+
+```text
+fio-3.33
+doca_nvme_fio_verify: (groupid=0, jobs=1): err= 0
+READ:  io=32.0MiB
+WRITE: io=32.0MiB
+issued rwts: total=8192,8192,0,0
+```
+
+fio 完成后，DPU 侧可查看 SPDK 统计：
+
+```bash
+$SPDK_RPC bdev_get_iostat -b Malloc0
+$SPDK_RPC nvmf_get_stats
+```
+
+期望 `Malloc0` 统计中至少包含 32MiB 写入和校验读，`nvmf_get_stats` 中 `pending_bdev_io` 为 `0`，且无 `io_error`。
+
+### 5.7 正常关停与清理
+
+清理顺序很重要。必须先让 Host NVMe driver 释放 controller 和队列，再让 DPU 侧销毁 listener/function。
+
+Host 侧确认没有用户态 I/O 进程，然后移除 PCI function：
+
+```bash
+$HOST_SSH "sh -c 'fuser -v /dev/nvme2n1 2>/dev/null || true; \
+  ps -eo pid,stat,comm,args | egrep \"fio|nvme\" | grep -v egrep || true; \
+  lspci -Dnnk -s 0000:41:00.0 || true'"
+
+$HOST_SSH "sh -c 'echo 1 > /sys/bus/pci/devices/0000:41:00.0/remove; \
+  sleep 2; \
+  lspci -Dnnk -s 0000:41:00.0 || true; \
+  ls -l /dev/nvme2 /dev/nvme2n1 2>/dev/null || true; \
+  nvme list 2>/dev/null | egrep \"DOCA000000000001|nvme2\" || true'"
+```
+
+期望 `0000:41:00.0`、`/dev/nvme2`、`/dev/nvme2n1` 都消失。
+
+DPU 侧 remove listener，并确认当前 QP 归零：
+
+```bash
+$SPDK_RPC nvmf_subsystem_remove_listener "$NQN" -t doca -a "$VUID"
+sleep 3
+$SPDK_RPC nvmf_get_stats
+$SPDK_RPC nvmf_get_subsystems
+```
+
+期望 `nvmf_get_stats` 中 `current_admin_qpairs=0`、`current_io_qpairs=0`、`pending_bdev_io=0`，并且 subsystem
+的 `listen_addresses` 为空。
+
+DPU 侧销毁 function，删除 subsystem 和 bdev：
+
+```bash
+$SPDK_RPC nvmf_doca_destroy_function -d "$DEV_NAME" -v "$VUID"
+$SPDK_RPC nvmf_doca_list_functions -d "$DEV_NAME"
+
+$SPDK_RPC nvmf_delete_subsystem "$NQN"
+$SPDK_RPC bdev_malloc_delete Malloc0
+
+$SPDK_RPC nvmf_get_subsystems
+$SPDK_RPC bdev_get_bdevs
+```
+
+期望：
+
+- `nvmf_doca_list_functions` 返回 `[]`。
+- `nvmf_get_subsystems` 只剩 discovery subsystem。
+- `bdev_get_bdevs` 返回 `[]`。
+
+停止 target 并清理 socket：
+
+```bash
+$SPDK_RPC spdk_kill_instance SIGTERM || true
+sleep 3
+ps -eo pid,ppid,stat,comm,args | grep '[d]oca_nvme_emulation' || true
+rm -f /var/tmp/doca_nvme.sock
+```
+
+如果按上述后台方式启动且 RPC 已不可用，可用 pidfile 做兜底停止：
+
+```bash
+kill -TERM "$(cat /tmp/doca_nvme_run/doca_nvme.pid)" 2>/dev/null || true
+sleep 3
+ps -p "$(cat /tmp/doca_nvme_run/doca_nvme.pid)" -o pid,ppid,stat,comm,args 2>/dev/null || true
+rm -f /var/tmp/doca_nvme.sock /tmp/doca_nvme_run/doca_nvme.pid
+```
+
+退出日志中可能出现多条：
+
+```text
+doca_devemu_pci_db_stop failed: Doorbell is already stopped
+```
+
+只要后续日志出现 `Destroyed PCI dev poll group`、`Shut down controller`、hotplug state `POWER_OFF`，且 target 正常退出，
+该重复 stop 日志可按非致命清理日志处理。
+
+### 5.8 最终确认
+
+DPU 侧确认 emulated function 和 target 进程无残留：
+
+```bash
+/opt/mellanox/doca/tools/doca_caps --list-rep-devs
+ps -eo pid,ppid,stat,comm,args | grep '[d]oca_nvme_emulation' || true
+ls -l /var/tmp/doca_nvme.sock 2>&1 || true
+```
+
+正常清理后，`doca_caps --list-rep-devs` 不应再包含本次 VUID `MT2529603G38GES2D0F0` / representor
+`0000:41:00.0`，`doca_nvme_emulation` 进程和 `/var/tmp/doca_nvme.sock` 都应消失。
+
+Host 侧确认无 emulated NVMe 残留：
+
+```bash
+$HOST_SSH "sh -c 'lspci -Dnn | egrep -i \"15b3:6001|NVMe SNAP\" || true; \
+  ls -l /dev/nvme2 /dev/nvme2n1 2>/dev/null || true; \
+  nvme list 2>/dev/null | egrep \"DOCA000000000001|nvme2\" || true; \
+  ps -eo pid,stat,comm,args | egrep \"fio|nvme list|remove\" | grep -v egrep || true'"
+```
+
+正常清理后，上述命令不应输出 emulated NVMe 设备或卡住的测试进程。
+
+### 5.9 常见错误
+
+| 日志/现象 | 处理方式 |
+| --- | --- |
+| RPC 报 `Connection refused` | 确认 `doca_nvme_emulation` 进程仍在运行，且 `/var/tmp/doca_nvme.sock` 是正在监听的 socket；崩溃后 socket 文件可能残留 |
+| Host `nvme list` 卡住 | 确认 DPU target 是否仍在；target crash 后 Host NVMe driver 可能等待后端响应 |
+| 清理时 target abort 或 Host 残留 `0000:41:00.0` | 检查是否跳过了 Host sysfs remove 或没有等待 QP 归零；按 5.7 顺序重做 |
+| `nvmf_doca_destroy_function` 报 representor 仍关联 emulated device | Host 侧 controller 尚未释放或 DPU listener/QP 未完全停止；先 Host `remove`，再 `nvmf_subsystem_remove_listener`，确认 `current_*_qpairs=0` 后重试 |
+
+## 6. samples/doca_devemu generic PCI samples
+
+### 6.1 适用范围与公共约定
 
 本章覆盖一组基于 `devemu_pci_type_config.h` 的 generic PCI DevEmu samples。它们分两类：
 
@@ -560,7 +923,7 @@ $HOST_SSH "lsblk -o NAME,TYPE,SIZE,MODEL,SERIAL /dev/vda"
 - 同一时间不要运行多个占用同一个 generic emulated endpoint 的 DevEmu sample。
 - Host VFIO open/close 可能触发 DPU 端 FLR 日志；除非 sample 明确失败，否则按预期现象处理。
 
-### 5.2 公共编译方式
+### 6.2 公共编译方式
 
 先编译 endpoint 管理 samples；它们用于获取或创建 `EMU_VUID`：
 
@@ -604,7 +967,7 @@ samples/doca_devemu/<sample-name>/dpu/build/doca_<sample-name>_dpu
 samples/doca_devemu/<sample-name>/host/build/doca_<sample-name>_host
 ```
 
-### 5.3 选择或创建 generic emulated endpoint
+### 6.3 选择或创建 generic emulated endpoint
 
 变量约定：
 
@@ -694,7 +1057,7 @@ HOST_VFIO_GROUP=<上一步 basename 输出，例如 44>
 
 只绑定 `15b3:1021` emulated endpoint，不要绑定 Host 物理 PF `0000:3f:00.0` / `0000:5c:00.0`。
 
-### 5.4 Host VFIO 准备
+### 6.4 Host VFIO 准备
 
 Host sample 运行前，将 emulated endpoint 绑定到 `vfio-pci`：
 
@@ -731,9 +1094,9 @@ $HOST_SSH "printf 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_inter
   cat /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts"
 ```
 
-完成测试后必须按 5.5 清理并恢复该参数。
+完成测试后必须按 6.5 清理并恢复该参数。
 
-### 5.5 公共清理
+### 6.5 公共清理
 
 Host 侧解除 `vfio-pci` 绑定并清除 driver override：
 
@@ -764,7 +1127,7 @@ emulated endpoint 绑定到 Host 物理 PF 驱动；本地实测对 `mlx5_core/b
 
 如果 Host 上存在前次测试残留的 `doca_devemu_pci_*` 进程或卡在 `drivers_probe` 的 shell，先清理残留再绑定 VFIO。
 
-### 5.6 devemu_pci_device_db
+### 6.6 devemu_pci_device_db
 
 `devemu_pci_device_db` 验证 Host driver 写 PCI BAR doorbell，DPU/BlueField 侧通过 DPA doorbell completion 收到
 doorbell value。
@@ -819,7 +1182,7 @@ $HOST_SSH "cd /root/ByteDance/doca-samples && \
 - DPU 端打印 `Received Doorbell value is 5678`。
 - DPU 端按 `Ctrl+c` 后打印 `Sample finished successfully`。
 
-### 5.7 devemu_pci_device_msix
+### 6.7 devemu_pci_device_msix
 
 `devemu_pci_device_msix` 验证 DPU/BlueField 侧对已有 generic emulated PCI device raise MSI-X vector，Host driver
 通过 VFIO eventfd 收到中断事件。
@@ -896,7 +1259,7 @@ cd /root/ByteDance/doca-samples
 本地实测默认 DPA datapath 成功；第二次重复 VFIO probe 时 Host endpoint 没有重新绑定成功，因此未继续验证
 `--msix-on-dpu` 可选路径。
 
-### 5.8 devemu_pci_device_dma
+### 6.8 devemu_pci_device_dma
 
 `devemu_pci_device_dma` 验证 Host driver 通过 VFIO/IOMMU 暴露 DMA buffer，DPU/BlueField 侧通过 DOCA DMA 对该
 Host memory 做双向复制。
@@ -964,7 +1327,7 @@ Memory range isn't aligned to 64B
 
 这是示例程序本地 buffer 对齐导致的性能提示；基础功能 smoke test 中可忽略。
 
-### 5.9 devemu_pci_device_stateful_region
+### 6.9 devemu_pci_device_stateful_region
 
 `devemu_pci_device_stateful_region` 验证 Host driver 通过 VFIO mmap emulated endpoint BAR 中的 stateful region，
 DPU/BlueField 侧注册 stateful-region write event 并在 Host 写入时收到事件。
@@ -1026,7 +1389,7 @@ $HOST_SSH "cd /root/ByteDance/doca-samples && \
 - DPU 端 `Printing values of stateful region ...` 后面的 dump 为全 0。
 - Host 端 read 模式读回全 0。
 
-### 5.10 devemu_pci_device_tlp_handler
+### 6.10 devemu_pci_device_tlp_handler
 
 `devemu_pci_device_tlp_handler` 验证 DPU/BlueField 侧通过 DOCA DevEmu PCI TLP channel 处理 raw PCIe TLP，Host
 driver 通过 VFIO mmap BAR transaction region 做写入或读取。
@@ -1123,20 +1486,20 @@ $HOST_SSH "cd /root/ByteDance/doca-samples && \
 - Host 端 read/dump transaction region 返回全 0。本地实测写入后 read 模式仍 dump 全 0，因此只用 Host 写/读命令成功返回和
   DPU 正常 poll/清理作为 smoke test 通过条件。
 
-### 5.11 通用常见错误
+### 6.11 通用常见错误
 
 | 日志/现象 | 处理方式 |
 | --- | --- |
 | DPU 端提示 `The VUID parameter is missing` | DB/DMA/stateful/MSI-X 必须通过 `-u <vuid>` 指定 emulated PCI device VUID |
 | DPU 端提示 `Matching emulated device not found` | 用 `doca_caps --list-rep-devs` 确认存在 `rep_type EMULATED` representor，且 VUID 输入正确 |
 | DPU 端提示 hotplug state 不是 `POWER_ON` | 确认 generic PCI emulated device 已被 Host 枚举且处于 power on 状态 |
-| Host 侧找不到 `15b3:1021` endpoint | 按 5.3 先运行 `devemu_pci_device_list` 枚举；若列表为空，再运行 `devemu_pci_device_hotplug` 创建 endpoint，必要时重启 Host 重新枚举 |
+| Host 侧找不到 `15b3:1021` endpoint | 按 6.3 先运行 `devemu_pci_device_list` 枚举；若列表为空，再运行 `devemu_pci_device_hotplug` 创建 endpoint，必要时重启 Host 重新枚举 |
 | Host 端提示 `VFIO group not viable` | 确认 IOMMU group 中所有设备都已绑定到 VFIO；本地调测中 group 44 只包含 `0000:40:00.0` |
 | Host 端 `VFIO_SET_IOMMU` 返回 `errno=1` | 检查 Host `dmesg`；若提示无 interrupt remapping，可临时打开 `vfio_iommu_type1.allow_unsafe_interrupts` 做 smoke test，完成后恢复 |
 | DPU 日志出现 FLR 并重建 PCI device | Host VFIO 初始化/释放会触发 FLR，属于预期现象 |
 | 重复测试时 `drivers_probe` 或重新绑定卡住 | 清理残留 sample/probe 进程，确认 `driver_override` 已清空并恢复 `allow_unsafe_interrupts=N`；必要时重新枚举或重启 Host 后再测 |
 
-### 5.12 sample 特有错误和限制
+### 6.12 sample 特有错误和限制
 
 | sample | 日志/现象 | 处理方式 |
 | --- | --- | --- |
@@ -1150,7 +1513,7 @@ $HOST_SSH "cd /root/ByteDance/doca-samples && \
 | TLP handler | DPU 端提示 `Sample does not support TLP channel with more or less than one downstream port` | 用 `mlxconfig` 将 TLP ports 数量配置为 1 后再运行 |
 | TLP handler | Host 端 read 模式 dump 全 0 | 当前本地实测现象；只用 Host 写/读命令成功返回和 DPU 正常 poll/清理作为 smoke test 通过条件 |
 
-## 6. 后续章节模板
+## 7. 后续章节模板
 
 ```text
 ## N. applications/<name> 或 samples/<group>/<name>
@@ -1163,9 +1526,16 @@ $HOST_SSH "cd /root/ByteDance/doca-samples && \
 
 ## 附录 A. 权限规则
 
-在当前测试环境中，以下操作统一按需要提权或非沙箱运行处理：
+在当前测试环境中，建议 DPU 和 Host 两端都先获取 root shell，并在沙箱外完整权限环境中执行本文档命令。
+如果 Host 通过 SSH 操作，优先使用 root 登录或让 `$HOST_SSH` 进入 root shell 后执行命令。
+不要依赖受限沙箱内的默认权限去访问或操作，否则容易出现权限拒绝、命令卡住或状态不一致。
+
+以下操作统一按需要 root/非沙箱运行处理：
 
 - 所有访问 IB/RDMA 设备的操作，包括访问 `/dev/infiniband`、verbs/uverbs 设备、RDMA netlink/devlink 信息等。
 - 所有 Mellanox/MLNX/DOCA 相关命令，包括 `/opt/mellanox/doca/...`、`mst`、`mlx*`、`mlnx*`、`ib*`、`rdma`、
   `devlink`，以及本仓库编译出的 DOCA application/sample 二进制。
 - 所有 iproute2 和 pciutils 相关命令，包括 `ip`、`bridge`、`tc`、`lspci`、`setpci` 等。
+- 所有 sysfs/procfs 设备控制操作，包括 PCI `remove/rescan`、VFIO/IOMMU 参数、hugepage 等。
+- 所有 SPDK/DPDK 运行与 RPC 操作，包括访问 `/var/tmp/*.sock`、创建或删除 bdev/subsystem/listener/function。
+- 所有 Host 远端硬件操作，包括 `$HOST_SSH` 内执行的 `lspci`、`nvme`、`fio`、driver bind/unbind 等。

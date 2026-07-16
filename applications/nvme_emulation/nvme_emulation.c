@@ -59,7 +59,8 @@ int main(int argc, char **argv)
 	if (result != DOCA_SUCCESS)
 		return EXIT_FAILURE;
 
-	result = doca_log_level_set_global_sdk_limit(DOCA_LOG_LEVEL_ERROR);
+	// Set log level for SDK messages
+	result = doca_log_level_set_global_sdk_limit(DOCA_LOG_LEVEL_DEBUG);
 	if (result != DOCA_SUCCESS)
 		return EXIT_FAILURE;
 
@@ -67,7 +68,12 @@ int main(int argc, char **argv)
 	result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
 	if (result != DOCA_SUCCESS)
 		return EXIT_FAILURE;
-	result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_ERROR);
+	result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_DEBUG);
+	if (result != DOCA_SUCCESS)
+		return EXIT_FAILURE;
+
+	// Set log level for application messages
+	result = doca_log_level_set_global_lower_limit(DOCA_LOG_LEVEL_DEBUG);
 	if (result != DOCA_SUCCESS)
 		return EXIT_FAILURE;
 
