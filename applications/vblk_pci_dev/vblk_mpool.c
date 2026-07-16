@@ -144,6 +144,13 @@ struct vblk_mpool *vblk_mpool_create(struct vblk_mpool_attr *attr)
 		DOCA_LOG_ERR("Failed to start buf pool, err: %s\n", doca_error_get_name(err));
 		goto bpool_destroy;
 	}
+	DOCA_LOG_INFO("VBLK_MPOOL_LAYOUT pool=%p memory=%p bytes=%zu aligned_bytes=%zu buf_size=%zu num_bufs=%d",
+		      mpool,
+		      mpool->memory,
+		      attr->num_bufs * attr->buf_size,
+		      vblk_mpool_hp_align(attr->num_bufs * attr->buf_size),
+		      attr->buf_size,
+		      attr->num_bufs);
 
 	return mpool;
 

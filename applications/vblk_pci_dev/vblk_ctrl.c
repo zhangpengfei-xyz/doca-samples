@@ -53,6 +53,61 @@ static struct doca_dev *g_vblk_dev;
 #define VBLK_IO_CTX_MAX_WAIT_ITERATIONS_RUNNING (1000000)
 #define MAX_VQ_PER_CYCLE 8
 
+static const char *vblk_req_type_name(uint32_t type)
+{
+	switch (type) {
+	case VBLK_T_IN:
+		return "READ";
+	case VBLK_T_OUT:
+		return "WRITE";
+	case VBLK_T_FLUSH:
+		return "FLUSH";
+	case VBLK_T_GET_ID:
+		return "GET_ID";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static uint16_t vblk_ctrl_io_ctx_id(struct vblk_ctrl_io_ctx *io_ctx)
+{
+	if (io_ctx == NULL || io_ctx->ctrl == NULL)
+		return UINT16_MAX;
+
+	return (uint16_t)(io_ctx - io_ctx->ctrl->io_ctxs);
+}
+
+static void vblk_log_buf_list(const char *tag, struct doca_buf *buf)
+{
+	uint32_t idx = 0;
+
+	while (buf != NULL && idx < 8) {
+		void *head = NULL, *data = NULL;
+		size_t len = 0, data_len = 0;
+		struct doca_buf *next = NULL;
+
+		(void)doca_buf_get_head(buf, &head);
+		(void)doca_buf_get_data(buf, &data);
+		(void)doca_buf_get_len(buf, &len);
+		(void)doca_buf_get_data_len(buf, &data_len);
+		DOCA_LOG_INFO("VBLK_IO_BUF %s[%u]: buf=%p head=%p data=%p len=%zu data_len=%zu",
+			      tag,
+			      idx,
+			      buf,
+			      head,
+			      data,
+			      len,
+			      data_len);
+		if (doca_buf_get_next_in_list(buf, &next) != DOCA_SUCCESS)
+			break;
+		buf = next;
+		idx++;
+	}
+
+	if (buf != NULL)
+		DOCA_LOG_INFO("VBLK_IO_BUF %s: truncated_after=%u", tag, idx);
+}
+
 /* at the moment the context is global per controller, ideally controller will have io
  * context per core and will spit queues across contexts
  */
@@ -742,6 +797,13 @@ static inline doca_error_t vblk_io_ctx_memcpy(struct vblk_ctrl_io_ctx *io_ctx, s
 	struct doca_dma_task_memcpy *task;
 
 	udata.ptr = req;
+	DOCA_LOG_INFO("VBLK_IO_DMA submit: type=%s(%u) req=%p direction=%s",
+		      vblk_req_type_name(req->type),
+		      req->type,
+		      req,
+		      (req->type == VBLK_T_IN || req->type == VBLK_T_GET_ID) ? "dpu_to_host" : "host_to_dpu");
+	vblk_log_buf_list("dma_host_data", doca_devemu_vblk_req_get_data(req->doca_req));
+	vblk_log_buf_list("dma_dpu_buf", req->dpu_buf);
 	if (req->type == VBLK_T_IN || req->type == VBLK_T_GET_ID)
 		err = doca_dma_task_memcpy_alloc_init(io_ctx->dma_ctx,
 						      req->dpu_buf,
@@ -790,6 +852,7 @@ static doca_error_t vblk_cmd_get_id(struct vblk_ctrl_io_ctx *io_ctx, struct vblk
 	(void)doca_buf_get_data(req->dpu_buf, &buf_ptr);
 	memcpy(buf_ptr, io_ctx->ctrl->vblk_dev_id, VBLK_GET_ID_SIZE);
 	(void)doca_buf_set_data_len(req->dpu_buf, VBLK_GET_ID_SIZE);
+	vblk_log_buf_list("get_id_dpu_buf", req->dpu_buf);
 	doca_buf_reset_data_len(doca_devemu_vblk_req_get_data(req->doca_req));
 
 	/* copy get id to the src_buf */
@@ -820,6 +883,7 @@ static doca_error_t vblk_cmd_read(struct vblk_ctrl_io_ctx *io_ctx, struct vblk_i
 	 * code below should be executed on the bdev read completion
 	 */
 	(void)doca_buf_set_data_len(req->dpu_buf, req_len);
+	vblk_log_buf_list("read_dpu_buf", req->dpu_buf);
 	buf = doca_devemu_vblk_req_get_data(req->doca_req);
 	do {
 		doca_buf_reset_data_len(buf);
@@ -846,6 +910,7 @@ static doca_error_t vblk_cmd_write(struct vblk_ctrl_io_ctx *io_ctx, struct vblk_
 		DOCA_LOG_ERR("failed to request mpool buffer of size %d, error: %s", req_len, doca_error_get_name(err));
 		return err;
 	}
+	vblk_log_buf_list("write_dpu_buf_alloc", req->dpu_buf);
 
 	err = vblk_io_ctx_memcpy(io_ctx, req);
 	if (err != DOCA_SUCCESS) {
@@ -889,6 +954,18 @@ static void vblk_io_handler(struct doca_devemu_vblk_req *req, uint32_t type, uin
 	}
 
 	vblk_io_request_init(vblk_req, req, type, sector);
+	DOCA_LOG_INFO("VBLK_IO_REQ begin: ep=%u io_ctx=%u type=%s(%u) sector=0x%lx req=%p user_req=%p "
+		      "data_len=%u list_len=%d",
+		      io_ctx->ctrl->ep_index,
+		      vblk_ctrl_io_ctx_id(io_ctx),
+		      vblk_req_type_name(type),
+		      type,
+		      sector,
+		      req,
+		      req_user_data,
+		      doca_devemu_vblk_req_get_data_len(req),
+		      doca_devemu_vblk_req_get_data_list_len(req));
+	vblk_log_buf_list("host_req_data", doca_devemu_vblk_req_get_data(req));
 
 	switch (type) {
 	case VBLK_T_IN:
@@ -931,7 +1008,11 @@ static void vblk_ctrl_dma_done(struct doca_dma_task_memcpy *dma_task,
 	struct vblk_io_request *req = task_user_data.ptr;
 	uint32_t out_len = doca_devemu_vblk_req_get_data_len(req->doca_req);
 
-	DOCA_LOG_TRC("DMA completed for req %p type %d, out len %d", req, req->type, out_len);
+	DOCA_LOG_INFO("VBLK_IO_DMA done: req=%p type=%s(%u) complete_len=%u",
+		      req,
+		      vblk_req_type_name(req->type),
+		      req->type,
+		      out_len);
 
 	doca_task_free(doca_dma_task_memcpy_as_task(dma_task));
 

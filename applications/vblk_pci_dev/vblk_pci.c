@@ -46,6 +46,128 @@ static struct pcie_virtio_dev virtio_dev;
 /* DW index of express slot_control+slot_status in PCI config space */
 #define EXPRESS_SLOT_CTRL_STS_DW ((TLP_PCI_CAP_OFFSET_EXPRESS + 24) / 4)
 
+static void vblk_pci_log_common_cfg_layout(void)
+{
+	DOCA_LOG_INFO("VBLK_LAYOUT common_cfg: size=0x%zx device_feature_select=0x%zx device_feature=0x%zx "
+		      "driver_feature_select=0x%zx driver_feature=0x%zx config_msix_vector=0x%zx "
+		      "num_queues=0x%zx device_status=0x%zx config_generation=0x%zx queue_select=0x%zx",
+		      sizeof(struct vblk_pci_virtio_pci_common_cfg),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, device_feature_select),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, device_feature),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, driver_feature_select),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, driver_feature),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, config_msix_vector),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, num_queues),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, device_status),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, config_generation),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, queue_select));
+	DOCA_LOG_INFO("VBLK_LAYOUT common_cfg.vq: base=0x%zx size=0x%zx queue_size=0x%zx "
+		      "queue_msix_vector=0x%zx queue_enable=0x%zx queue_notify_off=0x%zx "
+		      "queue_desc=0x%zx queue_driver=0x%zx queue_device=0x%zx "
+		      "queue_notif_config_data=0x%zx queue_reset=0x%zx",
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq),
+		      sizeof(struct vblk_pci_virtq_pci_cfg),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_size),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_msix_vector),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_enable),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_notify_off),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_desc),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_driver),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_device),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_notif_config_data),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, vq) +
+			      offsetof(struct vblk_pci_virtq_pci_cfg, queue_reset));
+	DOCA_LOG_INFO("VBLK_LAYOUT admin_queue: admin_queue_index=0x%zx admin_queue_num=0x%zx "
+		      "size=0x%zx note='fields present; current sample leaves them zero/disabled'",
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, admin_queue_index),
+		      offsetof(struct vblk_pci_virtio_pci_common_cfg, admin_queue_num),
+		      sizeof(uint16_t) * 2);
+}
+
+static void vblk_pci_log_bar_layout(const struct pcie_virtio_dev *dev)
+{
+	DOCA_LOG_INFO("VBLK_LAYOUT BAR0: log_size=%u size=0x%lx common=[0x%x..0x%x) "
+		      "isr=[0x%x..0x%x) dev_cfg=[0x%x..0x%x) msix_table=[0x%x..0x%x) "
+		      "msix_pba=[0x%x..0x%x) db=[0x%x..0x%x)",
+		      dev->bar64_map[VBLK_PCI_VIRTIO_BAR_ID].log_size,
+		      1UL << dev->bar64_map[VBLK_PCI_VIRTIO_BAR_ID].log_size,
+		      VBLK_PCI_VIRTIO_PCI_CFG_OFFSET,
+		      VBLK_PCI_VIRTIO_PCI_CFG_OFFSET + VBLK_PCI_VIRTIO_PCI_CFG_LEN,
+		      VBLK_PCI_VIRTIO_ISR_CFG_OFFSET,
+		      VBLK_PCI_VIRTIO_ISR_CFG_OFFSET + VBLK_PCI_VIRTIO_ISR_CFG_LEN,
+		      VBLK_PCI_VIRTIO_DEV_CFG_OFFSET,
+		      VBLK_PCI_VIRTIO_DEV_CFG_OFFSET + VBLK_PCI_VIRTIO_DEV_CFG_LEN,
+		      VBLK_PCI_VIRTIO_MSIX_TABLE_OFFSET,
+		      VBLK_PCI_VIRTIO_MSIX_TABLE_OFFSET + VBLK_PCI_VIRTIO_MSIX_TABLE_LEN,
+		      VBLK_PCI_VIRTIO_MSIX_PBA_OFFSET,
+		      VBLK_PCI_VIRTIO_MSIX_PBA_OFFSET + VBLK_PCI_VIRTIO_MSIX_PBA_LEN,
+		      VBLK_PCI_VIRTIO_DB_OFFSET,
+		      VBLK_PCI_VIRTIO_DB_OFFSET + VBLK_PCI_VIRTIO_DB_LEN);
+	DOCA_LOG_INFO("VBLK_LAYOUT caps: msix_cap_cfg=0x%zx common_cap_cfg=0x%zx notify_cap_cfg=0x%zx "
+		      "isr_cap_cfg=0x%zx device_cap_cfg=0x%zx pci_cfg_cap_cfg=0x%zx",
+		      offsetof(struct pcie_virtio_dev, cfg.msix_cap),
+		      offsetof(struct pcie_virtio_dev, cfg.common_cfg),
+		      offsetof(struct pcie_virtio_dev, cfg.notify_cfg),
+		      offsetof(struct pcie_virtio_dev, cfg.isr_cfg),
+		      offsetof(struct pcie_virtio_dev, cfg.device_cfg),
+		      offsetof(struct pcie_virtio_dev, cfg.pci_cfg));
+	DOCA_LOG_INFO("VBLK_LAYOUT virtio_caps: common bar=%u off=0x%x len=0x%x notify bar=%u off=0x%x "
+		      "len=0x%x multiplier=%u isr off=0x%x len=0x%x device off=0x%x len=0x%x "
+		      "msix_table_raw=0x%x msix_pba_raw=0x%x",
+		      dev->cfg.common_cfg.bar,
+		      dev->cfg.common_cfg.offset,
+		      dev->cfg.common_cfg.length,
+		      dev->cfg.notify_cfg.base.bar,
+		      dev->cfg.notify_cfg.base.offset,
+		      dev->cfg.notify_cfg.base.length,
+		      dev->cfg.notify_cfg.notify_off_multiplier,
+		      dev->cfg.isr_cfg.offset,
+		      dev->cfg.isr_cfg.length,
+		      dev->cfg.device_cfg.offset,
+		      dev->cfg.device_cfg.length,
+		      dev->cfg.msix_cap.table_offset,
+		      dev->cfg.msix_cap.pba_offset);
+	vblk_pci_log_common_cfg_layout();
+}
+
+static void vblk_pci_log_current_queue_cfg(const struct vblk_pci_virtio_dev *dev, const char *reason)
+{
+	const struct vblk_pci_virtio_pci_common_cfg *pci_cfg = &dev->pci_cfg;
+	const struct vblk_pci_virtq_pci_cfg *vq = &pci_cfg->vq;
+	const uint64_t bar0_base = dev->pcie_dev.cfg.regs.base_address64[VBLK_PCI_VIRTIO_BAR_ID] & ~0xFULL;
+	const uint64_t db_addr = bar0_base + dev->pcie_dev.cfg.notify_cfg.base.offset +
+				 (uint64_t)vq->queue_notify_off * dev->pcie_dev.cfg.notify_cfg.notify_off_multiplier;
+
+	DOCA_LOG_INFO("VBLK_QUEUE %s: ep=%u bdf=%02x:%02x.%u qid=%u size=%u enabled=%u "
+		      "msix=%u notify_off=%u notify_data=%u db_gpa=0x%lx "
+		      "desc_gpa=0x%lx driver_gpa=0x%lx device_gpa=0x%lx admin_index=%u admin_num=%u",
+		      reason,
+		      dev->ep_index,
+		      dev->bus,
+		      dev->device,
+		      dev->function,
+		      pci_cfg->queue_select,
+		      vq->queue_size,
+		      vq->queue_enable,
+		      vq->queue_msix_vector,
+		      vq->queue_notify_off,
+		      vq->queue_notif_config_data,
+		      db_addr,
+		      vq->queue_desc,
+		      vq->queue_driver,
+		      vq->queue_device,
+		      pci_cfg->admin_queue_index,
+		      pci_cfg->admin_queue_num);
+}
+
 static void bdf_map_remove_entry(struct vblk_tlp_context *ctx, struct bdf_map_entry *entry)
 {
 	struct bdf_map_entry **pp = &ctx->bdf_map[entry->key % BDF_MAP_SIZE];
@@ -909,6 +1031,7 @@ static doca_error_t vblk_pci_virtio_dev_init(struct vblk_pci_virtio_dev *dev, co
 	}
 
 	vblk_pci_virtio_dev_queue_init(dev);
+	vblk_pci_log_current_queue_cfg(dev, "init_default");
 
 	dev->pci_cfg_change_cb = attr->pci_cfg_change_cb;
 	dev->tlp_poll_cb = attr->tlp_poll_cb;
@@ -1183,6 +1306,7 @@ static doca_error_t vblk_pci_virtio_block_init(struct doca_dev *dev)
 	err = vblk_pci_fixup_virtio_dev(g_tlp_ctx.pci_type, &virtio_dev);
 	if (err != DOCA_SUCCESS)
 		goto fixup_failed;
+	vblk_pci_log_bar_layout(&virtio_dev);
 
 	return DOCA_SUCCESS;
 
@@ -1321,6 +1445,12 @@ static void vblk_pci_virtio_pci_cfg_write32(struct vblk_pci_virtio_dev *dev,
 		pci_cfg->device_feature = vblk_pci_feature_select(pci_cfg->device_feature_select, dev->device_features);
 	}
 
+	if (prev_cfg.driver_feature != pci_cfg->driver_feature) {
+		DOCA_LOG_INFO("VBLK_QUEUE driver_feature_write: select=%u value=0x%x",
+			      pci_cfg->driver_feature_select,
+			      pci_cfg->driver_feature);
+	}
+
 	if (prev_cfg.driver_feature_select != pci_cfg->driver_feature_select) {
 		DOCA_LOG_TRC("drv_ftr select: %d -> %d",
 			     prev_cfg.driver_feature_select,
@@ -1350,6 +1480,7 @@ static void vblk_pci_virtio_pci_cfg_write32(struct vblk_pci_virtio_dev *dev,
 		} else {
 			memset(&pci_cfg->vq, 0, sizeof(pci_cfg->vq));
 		}
+		vblk_pci_log_current_queue_cfg(dev, "queue_select");
 	}
 
 	/* Helpful debug: log when the driver enables/disables the currently selected queue */
@@ -1359,6 +1490,15 @@ static void vblk_pci_virtio_pci_cfg_write32(struct vblk_pci_virtio_dev *dev,
 			     prev_cfg.vq.queue_enable,
 			     pci_cfg->vq.queue_enable);
 	}
+
+	if (prev_cfg.config_msix_vector != pci_cfg->config_msix_vector) {
+		DOCA_LOG_INFO("VBLK_QUEUE config_msix_vector: %u -> %u",
+			      prev_cfg.config_msix_vector,
+			      pci_cfg->config_msix_vector);
+	}
+
+	if (memcmp(&prev_cfg.vq, &pci_cfg->vq, sizeof(pci_cfg->vq)) != 0)
+		vblk_pci_log_current_queue_cfg(dev, "common_cfg_write");
 
 	/* Reset PCI config before notifying the application layer, so
 	 * callback sees clean MSI-X/feature/queue state. Check original
@@ -1933,6 +2073,23 @@ static void vblk_pci_handle_cfg_write(struct doca_devemu_pci_tlp_channel_req *tl
 	m &= vblk_pci_ext_reg_wr_mask(virtio_dev, reg);
 	uint32_t rd = pcie_config_read(TO_PCIE_RAW_CFG(&virtio_dev->pcie_dev), reg);
 	pcie_config_write(TO_PCIE_RAW_CFG(&virtio_dev->pcie_dev), reg, (rd & ~m) | (td[0] & m));
+	if (reg == 1) {
+		DOCA_LOG_INFO("VBLK_LAYOUT endpoint_command: bdf=%02x:%02x.%u command=0x%04x status=0x%04x",
+			      virtio_dev->bus,
+			      virtio_dev->device,
+			      virtio_dev->function,
+			      virtio_dev->pcie_dev.cfg.regs.command,
+			      virtio_dev->pcie_dev.cfg.regs.status);
+	} else if (reg == 4 || reg == 5) {
+		DOCA_LOG_INFO("VBLK_LAYOUT endpoint_bar0: bdf=%02x:%02x.%u raw=0x%lx base=0x%lx size=0x%lx",
+			      virtio_dev->bus,
+			      virtio_dev->device,
+			      virtio_dev->function,
+			      (unsigned long)virtio_dev->pcie_dev.cfg.regs.base_address64[VBLK_PCI_VIRTIO_BAR_ID],
+			      (unsigned long)(virtio_dev->pcie_dev.cfg.regs.base_address64[VBLK_PCI_VIRTIO_BAR_ID] &
+					      ~0xFULL),
+			      1UL << virtio_dev->pcie_dev.bar64_map[VBLK_PCI_VIRTIO_BAR_ID].log_size);
+	}
 	vblk_pci_tlp_cfg_cpl_prep(tlp_req, TLP_FMT_3DW_NO_DATA, TLP_CPL_STATUS_SC, 0);
 	doca_devemu_pci_tlp_channel_req_complete_tlp(tlp_req, 1, dc->tlp_dev);
 }
