@@ -460,6 +460,32 @@ static doca_error_t nvmf_doca_pci_type_create_and_start(struct nvmf_doca_emulati
 		DOCA_LOG_ERR("Failed to start pci type: %s", doca_error_get_name(ret));
 		goto destroy_pci_type;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT pci_type started type=%s vendor=0x%04x device=0x%04x class=0x%06x "
+		      "bar0_size=0x%x bar1_size=0x%x stateful=[bar%u 0x%lx+0x%lx] db=[bar%u 0x%lx+0x%lx "
+		      "db_size=%u db_stride=%u num_db=%u] msix_table=[bar%u 0x%lx+0x%lx] "
+		      "msix_pba=[bar%u 0x%lx+0x%lx] num_msix=%u",
+		      NVME_TYPE_NAME,
+		      PCI_TYPE_VENDOR_ID,
+		      PCI_TYPE_DEVICE_ID,
+		      PCI_TYPE_CLASS_CODE,
+		      1U << layout_configs[0].log_size,
+		      1U << layout_configs[1].log_size,
+		      stateful_configs[0].bar_id,
+		      (unsigned long)stateful_configs[0].start_address,
+		      (unsigned long)stateful_configs[0].size,
+		      db_configs[0].region.bar_id,
+		      (unsigned long)db_configs[0].region.start_address,
+		      (unsigned long)db_configs[0].region.size,
+		      1U << db_configs[0].log_db_size,
+		      1U << db_configs[0].log_db_stride_size,
+		      PCI_TYPE_NUM_DB,
+		      msix_table_configs[0].bar_id,
+		      (unsigned long)msix_table_configs[0].start_address,
+		      (unsigned long)msix_table_configs[0].size,
+		      msix_pba_configs[0].bar_id,
+		      (unsigned long)msix_pba_configs[0].start_address,
+		      (unsigned long)msix_pba_configs[0].size,
+		      PCI_TYPE_NUM_MSIX);
 
 	uint8_t data[128] = {};
 	struct nvmf_doca_nvme_registers *registers = (struct nvmf_doca_nvme_registers *)&data[0];
@@ -487,6 +513,10 @@ static doca_error_t nvmf_doca_pci_type_create_and_start(struct nvmf_doca_emulati
 		doca_devemu_pci_type_stop(doca_emulation_manager->pci_type);
 		return ret;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT default_regs cap=0x%lx vs=0x%x stateful_default_bytes=%zu",
+		      (unsigned long)registers->cap.raw,
+		      registers->vs.raw,
+		      sizeof(data));
 
 	return ret;
 
@@ -1086,6 +1116,14 @@ static doca_error_t nvmf_doca_create_pci_dev_poll_group(struct nvmf_doca_pci_dev
 		free(pci_dev_pg);
 		return ret;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT pci_dev_pg_create pci_dev_pg=%p poll_group=%p pci_dev_admin=%p "
+		      "pci_dev=%p host_mmap=%p admin_qp=%p",
+		      pci_dev_pg,
+		      doca_poll_group,
+		      pci_dev_admin,
+		      pci_dev_admin->pci_dev,
+		      pci_dev_pg->host_mmap,
+		      admin_qp);
 
 	*ret_pci_dev_pg = pci_dev_pg;
 
@@ -1196,6 +1234,13 @@ static void nvmf_doca_create_admin_qp_done(void *cb_arg)
 	}
 
 	pci_dev_admin->admin_qp = admin_qp;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT admin_qp_ready pci_dev_admin=%p admin_qp=%p admin_cq=%p admin_sq=%p "
+		      "stateful_ready_offset=28 ready=0x%x",
+		      pci_dev_admin,
+		      admin_qp,
+		      admin_qp->admin_cq,
+		      admin_qp->admin_sq,
+		      ready);
 }
 
 /*
@@ -1217,6 +1262,16 @@ static void nvmf_doca_create_admin_qp(void *cb_arg)
 		spdk_thread_exec_msg(admin_thread, nvmf_doca_on_initialization_error, pci_dev_admin);
 		return;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT admin_qp_begin ctx=%p pci_dev_admin=%p poll_group=%p admin_qp=%p "
+		      "ASQ=0x%lx ACQ=0x%lx ASQS=%u ACQS=%u",
+		      ctx,
+		      pci_dev_admin,
+		      doca_poll_group,
+		      admin_qp,
+		      (unsigned long)ctx->admin_sq_address,
+		      (unsigned long)ctx->admin_cq_address,
+		      ctx->admin_sq_size,
+		      ctx->admin_cq_size);
 	TAILQ_INIT(&admin_qp->io_cqs);
 	TAILQ_INIT(&admin_qp->io_sqs);
 
@@ -1473,6 +1528,19 @@ static void handle_controller_register_events(struct doca_devemu_pci_dev *pci_de
 
 	if (registers->cc.bits.en == 1 && pci_dev_admin->state == NVMF_DOCA_LISTENER_UNINITIALIZED) {
 		DOCA_LOG_INFO("Creating controller");
+		DOCA_LOG_INFO("NVME_EMU_LAYOUT controller_enable pci_dev_admin=%p pci_dev=%p cap=0x%lx vs=0x%x "
+			      "cc=0x%x csts=0x%x aqa=0x%x ASQ=0x%lx ACQ=0x%lx ASQS=%u ACQS=%u",
+			      pci_dev_admin,
+			      pci_dev,
+			      (unsigned long)registers->cap.raw,
+			      registers->vs.raw,
+			      registers->cc.raw,
+			      registers->csts.raw,
+			      registers->aqa.raw,
+			      (unsigned long)registers->asq,
+			      (unsigned long)registers->acq,
+			      registers->aqa.bits.asqs + 1,
+			      registers->aqa.bits.acqs + 1);
 
 		pci_dev_admin->state = NVMF_DOCA_LISTENER_INITIALIZING;
 
@@ -1708,6 +1776,11 @@ static doca_error_t nvmf_doca_create_host_mmap(struct doca_devemu_pci_dev *pci_d
 		DOCA_LOG_ERR("Failed to start mmap: %s", doca_error_get_name(ret));
 		goto destroy_mmap;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT host_mmap_create pci_dev=%p emulation_manager=%p mmap=%p "
+		      "memrange=[0x0,0xffffffffffffffff] permissions=LOCAL_READ_WRITE",
+		      pci_dev,
+		      emulation_manager,
+		      mmap);
 
 	*mmap_out = mmap;
 
@@ -1805,6 +1878,14 @@ static int nvmf_doca_pci_dev_admin_create(struct nvmf_doca_transport *doca_trans
 		nvmf_doca_pci_dev_admin_destroy(pci_dev_admin);
 		return -EINVAL;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT pci_dev_admin_create trid=%s pci_dev_admin=%p pci_dev=%p dev_rep=%p "
+		      "emulation_manager=%p admin_pg_pe=%p",
+		      trid->traddr,
+		      pci_dev_admin,
+		      pci_dev_admin->pci_dev,
+		      pci_dev_admin->dev_rep,
+		      doca_emulation_manager,
+		      doca_transport->admin_pg.pe);
 
 	*pci_dev_admin_out = pci_dev_admin;
 
@@ -2035,6 +2116,11 @@ static struct spdk_nvmf_transport_poll_group *nvmf_doca_poll_group_create(struct
 	TAILQ_INIT(&doca_pg->pci_dev_pg_list);
 
 	TAILQ_INSERT_TAIL(&doca_transport->poll_groups, doca_pg, link);
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT poll_group_create doca_pg=%p spdk_group=%p io_pe=%p admin_qp_pe=%p",
+		      doca_pg,
+		      group,
+		      doca_pg->pe,
+		      doca_pg->admin_qp_pe);
 
 	return &doca_pg->pg;
 }

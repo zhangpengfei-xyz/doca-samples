@@ -977,6 +977,21 @@ static doca_error_t nvmf_doca_queue_create(const struct nvmf_doca_queue_create_a
 		}
 	}
 	queue->num_elements = num_elements;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT queue_create queue=%p mode=%s depth=%u elem_size=%u remote_base=0x%lx "
+		      "local_base=%p bytes=0x%x first_remote=0x%lx last_remote=0x%lx dma=%p inventory=%p mmap=%p",
+		      queue,
+		      attr->is_read_from_remote ? "remote_to_local" : "local_to_remote",
+		      num_elements,
+		      attr->element_size,
+		      (unsigned long)attr->remote_queue_address,
+		      queue->local_queue_address,
+		      queue_size,
+		      (unsigned long)attr->remote_queue_address,
+		      (unsigned long)(attr->remote_queue_address +
+				      (num_elements == 0 ? 0 : (num_elements - 1) * attr->element_size)),
+		      queue->dma,
+		      queue->inventory,
+		      queue->local_queue_mmap);
 
 	return DOCA_SUCCESS;
 }
@@ -1321,6 +1336,18 @@ static doca_error_t nvmf_doca_cq_create(const struct nvmf_doca_cq_create_attr *a
 		DOCA_LOG_ERR("Failed to create NVMf DOCA CQ: Failed to start DB - %s", doca_error_get_name(result));
 		return result;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT cq_create io=%p cq=%p qid=%u depth=%u host_cq=0x%lx db_id=%u "
+		      "db_bar%u_offset=0x%lx user_data=0 queue=%p",
+		      attr->io,
+		      cq,
+		      attr->cq_id,
+		      attr->cq_depth,
+		      (unsigned long)attr->host_cq_address,
+		      cq_db_id,
+		      db_configs[0].region.bar_id,
+		      (unsigned long)(db_configs[0].region.start_address +
+				      cq_db_id * (1U << db_configs[0].log_db_stride_size)),
+		      &cq->queue);
 	return DOCA_SUCCESS;
 }
 
@@ -1436,6 +1463,11 @@ static doca_error_t nvmf_doca_dpa_thread_create(const struct nvmf_doca_dpa_threa
 			     doca_error_get_name(result));
 		return result;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT dpa_thread_create dpa=%p thread=%p arg=0x%lx arg_size=%zu",
+		      dpa_thread->dpa,
+		      dpa_thread->thread,
+		      (unsigned long)dpa_thread->arg,
+		      attr->thread_arg_size);
 
 	return DOCA_SUCCESS;
 }
@@ -1570,6 +1602,15 @@ static doca_error_t nvmf_doca_io_fill_thread_arg(struct nvmf_doca_io *io, struct
 		.dpa_db_comp = dpa_db_comp,
 		.dpa_msix = dpa_msix,
 	};
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT dpa_thread_arg io=%p consumer_comp=0x%lx producer_comp=0x%lx "
+		      "producer=0x%lx consumer=0x%lx db_comp=0x%lx msix=0x%lx",
+		      io,
+		      (unsigned long)arg->dpa_consumer_comp,
+		      (unsigned long)arg->dpa_producer_comp,
+		      (unsigned long)arg->dpa_producer,
+		      (unsigned long)arg->dpa_consumer,
+		      (unsigned long)arg->dpa_db_comp,
+		      (unsigned long)arg->dpa_msix);
 
 	return DOCA_SUCCESS;
 }
@@ -1616,6 +1657,12 @@ static doca_error_t nvmf_doca_io_run_dpa_thread(struct nvmf_doca_io *io)
 	result = nvmf_doca_dpa_thread_run(&io->dpa_thread, &arg, sizeof(arg));
 	if (result != DOCA_SUCCESS)
 		return result;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT dpa_thread_run io=%p thread=%p dpa_arg=0x%lx cq_db_handle=0x%lx db_comp=0x%lx",
+		      io,
+		      io->dpa_thread.thread,
+		      (unsigned long)io->dpa_thread.arg,
+		      (unsigned long)dpa_cq_db,
+		      (unsigned long)arg.dpa_db_comp);
 
 	return DOCA_SUCCESS;
 }
@@ -1713,6 +1760,19 @@ doca_error_t nvmf_doca_io_create(const struct nvmf_doca_io_create_attr *attr, st
 	io->copy_data_cb = attr->copy_data_cb;
 	io->stop_sq_cb = attr->stop_sq_cb;
 	io->stop_io_cb = attr->stop_io_cb;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT io_create io=%p cq_id=%u cq_depth=%u host_cq=0x%lx max_sq=%u "
+		      "enable_msix=%d msix_idx=%u pe=%p dpa=%p db_comp=%p msix=%p",
+		      io,
+		      attr->cq_id,
+		      attr->cq_depth,
+		      (unsigned long)attr->host_cq_address,
+		      attr->max_num_sq,
+		      attr->enable_msix,
+		      attr->msix_idx,
+		      attr->pe,
+		      attr->dpa,
+		      io->db_comp,
+		      io->msix);
 
 	return DOCA_SUCCESS;
 }
@@ -2021,6 +2081,18 @@ static doca_error_t nvmf_doca_dma_pool_create(const struct nvmf_doca_dma_pool_cr
 			     doca_error_get_name(result));
 		return result;
 	}
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT data_pool_create pool=%p sq=%p max_ops=%u buf_size=0x%x local_base=%p "
+		      "local_bytes=0x%x local_mmap=%p host_mmap=%p host_inventory=%p dma=%p",
+		      dma_pool,
+		      attr->dma_user_data,
+		      attr->max_dma_operations,
+		      attr->max_dma_operation_size,
+		      dma_pool->local_data_memory,
+		      local_data_memory_size,
+		      dma_pool->local_data_mmap,
+		      dma_pool->host_data_mmap,
+		      dma_pool->host_data_inventory,
+		      dma_pool->dma);
 
 	return DOCA_SUCCESS;
 }
@@ -2119,6 +2191,22 @@ static void nvmf_doca_sq_update_pi(struct nvmf_doca_sq *sq, uint32_t new_pi)
 	} else {
 		num_sqes = ((sq->queue.num_elements - pi) + new_pi);
 	}
+	if (num_sqes != 0) {
+		static uint32_t sq_pi_log_count;
+
+		if (sq_pi_log_count < 128) {
+			DOCA_LOG_INFO("NVME_EMU_LAYOUT sq_pi_update sq=%p qid=%u old_pi=%u new_pi=%u num_sqes=%u "
+				      "queue_depth=%u first_sqe_idx=%u",
+				      sq,
+				      sq->sq_id,
+				      pi,
+				      new_pi,
+				      num_sqes,
+				      sq->queue.num_elements,
+				      pi % sq->queue.num_elements);
+			sq_pi_log_count++;
+		}
+	}
 
 	for (uint16_t sqe_count = 0; sqe_count < num_sqes; sqe_count++) {
 		sqe_idx = (pi + sqe_count) % sq->queue.num_elements;
@@ -2147,6 +2235,17 @@ static void nvmf_doca_io_handle_host_db_msg(struct nvmf_doca_io *io, const struc
 {
 	struct nvmf_doca_sq *sq = (struct nvmf_doca_sq *)msg->host_db_data.db_user_data;
 	uint32_t db_value = msg->host_db_data.db_value;
+	static uint32_t host_db_log_count;
+
+	if (host_db_log_count < 128) {
+		DOCA_LOG_INFO("NVME_EMU_LAYOUT host_db io=%p target=%s sq=%p cq=%p db_value=%u",
+			      io,
+			      sq == NULL ? "CQ_CI" : "SQ_PI",
+			      sq,
+			      &io->cq,
+			      db_value);
+		host_db_log_count++;
+	}
 
 	if (sq == NULL) {
 		nvmf_doca_cq_update_ci(&io->cq, db_value);
@@ -2173,6 +2272,23 @@ static void nvmf_doca_sq_sqe_read_cb(struct doca_dma_task_memcpy *task,
 
 	sqe_buf = doca_dma_task_memcpy_get_dst(task);
 	doca_buf_get_data(sqe_buf, (void **)&sqe);
+	static uint32_t sqe_log_count;
+	if (sqe_log_count < 128) {
+		struct spdk_nvme_cmd *cmd = (struct spdk_nvme_cmd *)&sqe->data[0];
+
+		DOCA_LOG_INFO("NVME_EMU_LAYOUT sqe_read sq=%p qid=%u sqe_idx=%u opcode=0x%x cid=%u "
+			      "cdw10=0x%x cdw11=0x%x prp1=0x%lx prp2=0x%lx",
+			      sq,
+			      sq->sq_id,
+			      sqe_idx,
+			      cmd->opc,
+			      cmd->cid,
+			      cmd->cdw10,
+			      cmd->cdw11,
+			      (unsigned long)cmd->dptr.prp.prp1,
+			      (unsigned long)cmd->dptr.prp.prp2);
+		sqe_log_count++;
+	}
 
 	sq->io->fetch_sqe_cb(sq, sqe, sqe_idx);
 }
@@ -2494,6 +2610,22 @@ static doca_error_t nvmf_doca_sq_create(const struct nvmf_doca_sq_create_attr *a
 	sq->spdk_qp.transport = attr->transport;
 	sq->ctx = attr->ctx;
 	sq->result = DOCA_SUCCESS;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT sq_create io=%p sq=%p qid=%u depth=%u host_sq=0x%lx db_id=%u "
+		      "db_bar%u_offset=0x%lx db_handle=0x%lx user_data=0x%lx request_pool=%p queue=%p data_pool=%p",
+		      attr->io,
+		      sq,
+		      attr->sq_id,
+		      attr->sq_depth,
+		      (unsigned long)attr->host_sq_address,
+		      sq_db_id,
+		      db_configs[0].region.bar_id,
+		      (unsigned long)(db_configs[0].region.start_address +
+				      sq_db_id * (1U << db_configs[0].log_db_stride_size)),
+		      (unsigned long)sq->db_handle,
+		      (unsigned long)sq,
+		      sq->request_pool_memory,
+		      &sq->queue,
+		      &sq->dma_pool);
 
 	return DOCA_SUCCESS;
 }
@@ -2636,6 +2768,12 @@ void nvmf_doca_io_add_sq(struct nvmf_doca_io *io, const struct nvmf_doca_io_add_
 		return;
 	}
 	sq->db_state = NVMF_DOCA_SQ_DB_BIND_REQUESTED;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT sq_bind_requested io=%p sq=%p qid=%u db_handle=0x%lx cookie=0x%lx",
+		      io,
+		      sq,
+		      sq->sq_id,
+		      (unsigned long)sq->db_handle,
+		      (unsigned long)sq);
 }
 
 /*
@@ -2648,5 +2786,9 @@ static void nvmf_doca_io_handle_bind_sq_db_done_msg(const struct comch_msg *msg)
 	struct nvmf_doca_sq *sq = (struct nvmf_doca_sq *)msg->bind_sq_db_done_data.cookie;
 
 	sq->db_state = NVMF_DOCA_SQ_DB_BOUND;
+	DOCA_LOG_INFO("NVME_EMU_LAYOUT sq_bind_done sq=%p qid=%u db_handle=0x%lx",
+		      sq,
+		      sq->sq_id,
+		      (unsigned long)sq->db_handle);
 	nvmf_doca_sq_add_continue(sq);
 }
