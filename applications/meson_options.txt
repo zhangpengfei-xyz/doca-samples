@@ -115,5 +115,7 @@ option('enable_virtiofs', type: 'boolean', value: false,
 	description: 'Enable Virtiofs application.')
 option('enable_vnet_pci_dev', type: 'boolean', value: false,
 	description: 'Enable VirtIO Net PCI Device application.')
+option('enable_vfio_adminq', type: 'boolean', value: false,
+	description: 'Enable the VFIO AdminQ PCI front-end, device back-end and host emulator.')
 option('enable_yara_inspection', type: 'boolean', value: false,
 	description: 'Enable Yara Inspection application.')

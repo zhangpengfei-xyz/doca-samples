@@ -343,7 +343,7 @@ app_list = [
 	    'yara_inspection',
 ]
 if is_dpu
-	app_list += ['vblk_pci_dev', 'vnet_pci_dev']
+	app_list += ['vblk_pci_dev', 'vnet_pci_dev', 'vfio_adminq']
 endif
 
 fs = import('fs')
