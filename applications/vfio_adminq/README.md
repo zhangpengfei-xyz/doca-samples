@@ -1,7 +1,14 @@
 # VFIO AdminQ 最小验证程序
 
-本目录按 [DESIGN.md](DESIGN.md) 实现三个独立程序，并严格复用已验证的
-SRDMA/io-engine ABI：
+本目录包含两代设计：
+
+- [BASIC_DESIGN.md](BASIC_DESIGN.md)：已经实现的 v1 最小 VFIO AdminQ/DMA 闭环。
+- [SRDMA_DRIVER_DESIGN.md](SRDMA_DRIVER_DESIGN.md)：对接真实 `srdma.ko` 的 v2
+  目标设计，包括 BAR0/BAR2、MSI-X、真实 AdminQ、EQ/CQ/QP 和数据面边界。
+- [host-ctrl-test/](host-ctrl-test/)：Host 侧无数据面的 libibverbs 控制面测试，
+  覆盖 UCTX、PD、MR、EQ、CQ、QP、GID、统计、健康及 AdminQ 计数核对。
+
+当前代码仍按 v1 设计实现三个独立程序，并严格复用已验证的 SRDMA/io-engine ABI：
 
 - `doca_vfio_adminq_pci_fe`：DPU PCI 前端，负责设备插拔、PCI config/BAR0、TLP 和
   Gemini 服务端。

@@ -534,7 +534,7 @@ close DOCA device
 
 ```text
 applications/vfio_adminq/
-  DESIGN.md
+  BASIC_DESIGN.md
   meson.build
   meson_options.txt              # 如顶层构建需要
   common/
