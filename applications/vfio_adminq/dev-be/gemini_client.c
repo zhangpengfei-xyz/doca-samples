@@ -281,6 +281,7 @@ static uint8_t srdma_gemini_handle_plug(
 
     opts = runtime->opts;
     opts.vhca_id = vhca_id;
+    opts.generation = plug->rsvd1[0];
 
     result = srdma_backend_init(&opts);
     if (result != DOCA_SUCCESS) {
@@ -347,7 +348,16 @@ static uint8_t srdma_gemini_handle_start(
         fprintf(stderr, "invalid SRDMA START TX queue configuration\n");
         return GEMINI_MSG_ERR_INVALID_PAYLOAD;
     }
-    srdma_backend_set_adminq(start->txq_addr, start->txq_depth);
+    if (start->rxq_addr == 0 || start->aeq_addr == 0 ||
+        start->txq_depth != SRDMA_ADMINQ_DEPTH ||
+        start->rxq_depth != SRDMA_ADMINQ_DEPTH ||
+        start->aeq_depth != SRDMA_AEQ_DEPTH) {
+        fprintf(stderr, "invalid SRDMA START queue configuration\n");
+        return GEMINI_MSG_ERR_INVALID_PAYLOAD;
+    }
+    srdma_backend_set_adminq(start->txq_addr, start->rxq_addr,
+                             start->aeq_addr, start->txq_depth,
+                             start->aeq_depth);
     return 0;
 }
 

@@ -1,5 +1,6 @@
 #include "gemini_client.h"
 #include "srdma_backend.h"
+#include "../common/srdma_uar_ipc.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -26,13 +27,16 @@ static void print_usage(const char *prog)
            "(default: %u)\n"
            "  --socket <path>         Gemini server socket "
            "(default: %s)\n"
+           "  --uar-ipc <path>        UAR shared ring path "
+           "(default: %s)\n"
            "  --timeout-sec <n>       serve timeout; 0 means forever "
            "(default: %u)\n"
            "  -h, --help              show this help\n",
            prog, SRDMA_DPU_DEFAULT_PCI_ADDR,
            SRDMA_DPU_DEFAULT_PCI_TYPE_NAME,
            SRDMA_DPU_DEFAULT_DB_COUNT, SRDMA_DPU_DEFAULT_DB_ID,
-           SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE, SRDMA_GEMINI_DEFAULT_SOCKET, 0);
+           SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE, SRDMA_GEMINI_DEFAULT_SOCKET,
+           SRDMA_UAR_IPC_DEFAULT_PATH, 0);
 }
 
 static int parse_u16(const char *name, const char *value, uint16_t *out)
@@ -94,6 +98,7 @@ static int parse_args(int argc, char **argv,
         {"db-id", required_argument, NULL, 'd'},
         {"local-dma-size", required_argument, NULL, 's'},
         {"socket", required_argument, NULL, 'g'},
+        {"uar-ipc", required_argument, NULL, 'u'},
         {"timeout-sec", required_argument, NULL, 'T'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
@@ -126,6 +131,9 @@ static int parse_args(int argc, char **argv,
             break;
         case 'g':
             *gemini_socket = optarg;
+            break;
+        case 'u':
+            opts->uar_ipc_path = optarg;
             break;
         case 'T':
             if (parse_u32("timeout-sec", optarg, &opts->timeout_sec) != 0) {

@@ -22,11 +22,15 @@ struct srdma_backend_opts {
     uint32_t db_id;
     size_t local_dma_size;
     uint32_t timeout_sec;
+    const char *uar_ipc_path;
+    uint64_t generation;
 };
 
 void srdma_backend_default_opts(struct srdma_backend_opts *opts);
 doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts);
-void srdma_backend_set_adminq(uint64_t txq_iova, uint32_t txq_depth);
+void srdma_backend_set_adminq(uint64_t txq_iova, uint64_t rxq_iova,
+                              uint64_t aeq_iova, uint32_t txq_depth,
+                              uint32_t aeq_depth);
 void srdma_backend_clear_adminq(void);
 doca_error_t srdma_backend_progress(void);
 void srdma_backend_cleanup(void);
