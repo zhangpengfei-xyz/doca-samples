@@ -20,9 +20,6 @@ srdma_doorbell_bind_db_rpc(doca_dpa_dev_devemu_pci_db_completion_t db_comp,
         return SRDMA_DB_RPC_ERROR;
     }
 
-    doca_dpa_dev_devemu_pci_db_completion_request_notification(db_comp);
-    doca_dpa_dev_devemu_pci_db_request_notification(db);
-
     return SRDMA_DB_RPC_SUCCESS;
 }
 
@@ -41,13 +38,14 @@ srdma_doorbell_unbind_db_rpc(doca_dpa_dev_devemu_pci_db_completion_t db_comp,
 static void srdma_doorbell_send_msg(doca_dpa_dev_comch_producer_t producer,
                                     const struct srdma_db_completion *db_comp)
 {
+    doca_dpa_dev_devemu_pci_db_request_notification(db_comp->db);
+
     struct srdma_db_msg msg = {
         .type = SRDMA_DB_MSG_HOST_DB,
         .db_value = doca_dpa_dev_devemu_pci_db_get_value(db_comp->db),
         .user_data = db_comp->user_data,
     };
 
-    (void)doca_dpa_dev_devemu_pci_db_request_notification(db_comp->db);
     (void)doca_dpa_dev_comch_producer_post_send_imm_only(
         producer, 1, (const uint8_t *)&msg, sizeof(msg),
         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH |

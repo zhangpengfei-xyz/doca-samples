@@ -1,10 +1,8 @@
-#include "../common/srdma_uar_ipc.h"
+#include "../common/vfio_adminq_abi.h"
 #include "../dev-be/srdma_admin.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #define CHECK(condition) do {                                                \
     if (!(condition)) {                                                      \
@@ -172,46 +170,43 @@ static int test_admin_resources(void)
     return 0;
 }
 
-static int test_uar_ipc(void)
+static int test_doorbell_layout(void)
 {
-    struct srdma_uar_ipc producer;
-    struct srdma_uar_ipc consumer;
-    struct srdma_uar_event event = {
-        .endpoint_id = 3,
-        .uctx_id = 4,
-        .offset = 0x80,
-        .width = 8,
-        .value = UINT64_C(0x1122334455667788),
-        .generation = 9,
+    static const uint32_t hw_ids[SRDMA_DB_TYPE_COUNT] = {
+        [SRDMA_DB_ADMINQ] = SRDMA_DB_HW_ADMINQ,
+        [SRDMA_DB_AEQ] = SRDMA_DB_HW_AEQ,
+        [SRDMA_DB_CEQ] = SRDMA_DB_HW_CEQ,
+        [SRDMA_DB_CQ] = SRDMA_DB_HW_CQ,
+        [SRDMA_DB_SQ] = SRDMA_DB_HW_SQ,
+        [SRDMA_DB_RQ] = SRDMA_DB_HW_RQ,
     };
-    struct srdma_uar_event received;
-    char path[80];
-    uint64_t wakeups;
 
-    snprintf(path, sizeof(path), "/tmp/srdma-uar-test-%ld", (long)getpid());
-    CHECK(srdma_uar_ipc_producer_init(&producer, path) == 0);
-    CHECK(srdma_uar_ipc_consumer_init(&consumer, path) == 0);
-    CHECK(srdma_uar_ipc_producer_progress(&producer) == 1);
-    CHECK(srdma_uar_ipc_push(&producer, &event) == 0);
-    CHECK(read(srdma_uar_ipc_event_fd(&consumer), &wakeups,
-               sizeof(wakeups)) == (ssize_t)sizeof(wakeups));
-    CHECK(wakeups == 1);
-    CHECK(srdma_uar_ipc_pop(&consumer, &received) == 1);
-    CHECK(memcmp(&event, &received, sizeof(event)) == 0);
-    CHECK(srdma_uar_ipc_pop(&consumer, &received) == 0);
-    for (unsigned int i = 0; i < SRDMA_UAR_IPC_DEPTH; i++)
-        CHECK(srdma_uar_ipc_push(&producer, &event) == 0);
-    CHECK(srdma_uar_ipc_push(&producer, &event) == -ENOSPC);
-    CHECK(srdma_uar_ipc_is_fatal(&consumer));
-    srdma_uar_ipc_cleanup(&consumer);
-    srdma_uar_ipc_cleanup(&producer);
+    CHECK(VFIO_ADMINQ_DB_REGION_OFFSET == UINT32_C(0x8000));
+    CHECK(VFIO_ADMINQ_DB_REGION_SIZE == UINT32_C(0x1000));
+    CHECK(VFIO_ADMINQ_DB_LOG_SIZE == 1U);
+    CHECK(VFIO_ADMINQ_DB_STRIDE_LOG_SIZE == 3U);
+    CHECK(VFIO_ADMINQ_DB_COUNT == 33U);
+    CHECK(SRDMA_UAR_ADMINQ_DB == 0x000U);
+    CHECK(SRDMA_UAR_AEQ_DB == 0x008U);
+    CHECK(SRDMA_UAR_CEQ_DB == 0x040U);
+    CHECK(SRDMA_UAR_CQ_DB == 0x080U);
+    CHECK(SRDMA_UAR_RQ_DB == 0x0c0U);
+    CHECK(SRDMA_UAR_SQ_DB == 0x100U);
+    CHECK(hw_ids[SRDMA_DB_ADMINQ] == 0U);
+    CHECK(hw_ids[SRDMA_DB_AEQ] == 1U);
+    CHECK(hw_ids[SRDMA_DB_CEQ] == 8U);
+    CHECK(hw_ids[SRDMA_DB_CQ] == 16U);
+    CHECK(hw_ids[SRDMA_DB_RQ] == 24U);
+    CHECK(hw_ids[SRDMA_DB_SQ] == 32U);
+    for (size_t i = 0; i < SRDMA_DB_TYPE_COUNT; i++)
+        CHECK(hw_ids[i] < VFIO_ADMINQ_DB_COUNT);
     return 0;
 }
 
 int main(void)
 {
     CHECK(test_admin_resources() == 0);
-    CHECK(test_uar_ipc() == 0);
+    CHECK(test_doorbell_layout() == 0);
     puts("srdma control tests passed");
     return 0;
 }

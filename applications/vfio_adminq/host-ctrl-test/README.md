@@ -1,7 +1,7 @@
 # sRDMA Host 控制面测试
 
-`srdma_ctrl_test` 是一个不投递 WQE 的最小 libibverbs 程序，用于同时验证
-Host `srdma.ko` 和 `vfio_adminq` 后端的控制面。
+`srdma_ctrl_test` 是一个最小 libibverbs 程序，用于同时验证 Host `srdma.ko`
+和 `vfio_adminq` 后端的控制面及 doorbell 路径。
 
 ## 覆盖范围
 
@@ -17,8 +17,9 @@ Host `srdma.ko` 和 `vfio_adminq` 后端的控制面。
 - 后端核对：比较测试前后的
   `/sys/kernel/debug/srdma/<BDF>/commands/<OP>/{n,failed}`。
 
-程序不会调用 `ibv_post_send()`、`ibv_post_recv()` 或 `ibv_poll_cq()`，因此不依赖
-当前尚未实现的数据面。
+默认不会调用 `ibv_post_send()`、`ibv_post_recv()` 或 `ibv_poll_cq()`，因此不依赖
+当前尚未实现的数据面。使用 `--doorbell-wqes` 时会各投递一个 receive/send WQE，
+只用于验证 RQ/SQ doorbell 写入和 DPA completion；程序不等待数据面完成。
 
 为避免中断 Host 管理连接，程序不会主动 flap netdev，所以 `NETDEV_UP/DOWN` 不在
 单次测试范围；它们应在独立维护窗口通过现有驱动生命周期测试验证。同理，CEQ
@@ -50,6 +51,13 @@ ssh 192.168.0.100 'cd /root/host-ctrl-test && make'
 ```bash
 sudo ./srdma_ctrl_test --device srdma_0 \
     --gid-cycle 198.18.0.1/32
+```
+
+验证全部 doorbell（包括 RQ/SQ）时：
+
+```bash
+sudo ./srdma_ctrl_test --device srdma_0 \
+    --gid-cycle 198.18.0.1/32 --doorbell-wqes
 ```
 
 `--gid-cycle` 会在 sRDMA 绑定的 netdev 上临时添加地址，等待 `ADD_GID`，随后立即

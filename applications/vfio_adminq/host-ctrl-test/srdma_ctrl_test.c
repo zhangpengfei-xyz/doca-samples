@@ -33,6 +33,7 @@ struct options {
 	unsigned int vector;
 	size_t mr_size;
 	bool basic_qp;
+	bool doorbell_wqes;
 };
 
 struct command_count {
@@ -99,6 +100,7 @@ static void usage(const char *program)
 	       "  -m, --mr-size BYTES     registered MR size (default: 65536)\n"
 	       "  -g, --gid-cycle CIDR    temporarily add/delete CIDR on bound netdev\n"
 	       "      --basic-qp          stop QP at INIT; skip RTR/RTS/ERR/RESET\n"
+	       "      --doorbell-wqes     post one receive/send WQE to ring RQ/SQ DBs\n"
 	       "  -h, --help              show this help\n",
 	       program);
 }
@@ -138,6 +140,7 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		{ "mr-size", required_argument, NULL, 'm' },
 		{ "gid-cycle", required_argument, NULL, 'g' },
 		{ "basic-qp", no_argument, NULL, 1 },
+		{ "doorbell-wqes", no_argument, NULL, 2 },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -166,6 +169,9 @@ static int parse_options(int argc, char **argv, struct options *opts)
 			break;
 		case 1:
 			opts->basic_qp = true;
+			break;
+		case 2:
+			opts->doorbell_wqes = true;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -573,9 +579,51 @@ static int qp_to_init(struct ibv_qp *qp, unsigned int port)
 	return query_qp_state(qp, IBV_QPS_INIT);
 }
 
+static int ring_wq_doorbells(struct ibv_qp *qp, struct ibv_mr *mr, void *buffer)
+{
+	struct ibv_sge recv_sge = {
+		.addr = (uintptr_t)buffer,
+		.length = 64,
+		.lkey = mr->lkey,
+	};
+	struct ibv_sge send_sge = {
+		.addr = (uintptr_t)buffer + 64,
+		.length = 64,
+		.lkey = mr->lkey,
+	};
+	struct ibv_recv_wr recv_wr = {
+		.wr_id = 0x5251,
+		.sg_list = &recv_sge,
+		.num_sge = 1,
+	};
+	struct ibv_send_wr send_wr = {
+		.wr_id = 0x5351,
+		.sg_list = &send_sge,
+		.num_sge = 1,
+		.opcode = IBV_WR_SEND,
+		.send_flags = IBV_SEND_SIGNALED,
+	};
+	struct ibv_recv_wr *bad_recv = NULL;
+	struct ibv_send_wr *bad_send = NULL;
+
+	if (ibv_post_recv(qp, &recv_wr, &bad_recv)) {
+		fail("RQ doorbell WQE", strerror(errno));
+		return -1;
+	}
+	pass("RQ doorbell WQE", "one receive WQE posted; completion not required");
+
+	if (ibv_post_send(qp, &send_wr, &bad_send)) {
+		fail("SQ doorbell WQE", strerror(errno));
+		return -1;
+	}
+	pass("SQ doorbell WQE", "one send WQE posted; completion not required");
+	return 0;
+}
+
 static int qp_to_rts(struct ibv_qp *qp, unsigned int port,
 		     enum ibv_mtu mtu, const union ibv_gid *gid,
-		     unsigned int gid_index)
+		     unsigned int gid_index, bool doorbell_wqes,
+		     struct ibv_mr *mr, void *buffer)
 {
 	struct ibv_qp_attr attr = { 0 };
 	int mask;
@@ -616,6 +664,8 @@ static int qp_to_rts(struct ibv_qp *qp, unsigned int port,
 	}
 	pass("QP RTR -> RTS", "state only; no WQE posted");
 	if (query_qp_state(qp, IBV_QPS_RTS))
+		return -1;
+	if (doorbell_wqes && ring_wq_doorbells(qp, mr, buffer))
 		return -1;
 
 	memset(&attr, 0, sizeof(attr));
@@ -784,8 +834,9 @@ int main(int argc, char **argv)
 	snprintf(debug_root, sizeof(debug_root), "/sys/kernel/debug/srdma/%s", bdf);
 	printf("sRDMA control-plane test\n"
 	       "  device=%s bdf=%s netdev=%s port=%u vector=%u\n"
-	       "  data-plane WQEs: disabled by design\n",
-	       dev_name, bdf, netdev[0] ? netdev : "<none>", opts.port, opts.vector);
+	       "  doorbell WQEs: %s (no data-plane completion expected)\n",
+	       dev_name, bdf, netdev[0] ? netdev : "<none>", opts.port, opts.vector,
+	       opts.doorbell_wqes ? "enabled" : "disabled");
 
 	if (snapshot_commands(debug_root, &before)) {
 		fail("AdminQ debugfs", "mount debugfs and run as root");
@@ -907,7 +958,8 @@ int main(int argc, char **argv)
 			fail("QP full state machine", "requires a non-zero GID");
 		} else if (!qp_to_rts(qp, opts.port,
 				      port_attr.active_mtu ? port_attr.active_mtu : IBV_MTU_1024,
-				      &first_gid, first_gid_index)) {
+				      &first_gid, first_gid_index, opts.doorbell_wqes,
+				      mr, buffer)) {
 			qp_full_done = true;
 		}
 	} else if (opts.basic_qp) {
