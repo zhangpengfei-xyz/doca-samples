@@ -67,6 +67,7 @@ struct pci_fe {
     uint8_t mac[6];
     uint64_t generation;
     uint32_t heartbeat;
+    uint64_t heartbeat_last_ns;
     struct srdma_uar_ipc uar_ipc;
 };
 
