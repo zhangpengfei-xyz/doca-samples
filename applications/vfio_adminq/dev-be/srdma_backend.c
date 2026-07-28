@@ -2,10 +2,8 @@
 #include "srdma_admin.h"
 
 #include "../common/vfio_adminq_abi.h"
-#include "../common/srdma_uar_ipc.h"
 #include "doorbell_common.h"
 
-#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,9 +36,9 @@ DOCA_LOG_REGISTER(SRDMA_BACKEND);
 #define SRDMA_PCIE_CAP_ID 0x10U
 #define SRDMA_PCIE_CAP_OFFSET 0x50U
 #define SRDMA_PCIE_CAP_LENGTH 0x3cU
-/* Legacy DPA doorbell helpers remain compiled but are not used by v2. */
+/* Host doorbells are consumed by the DPA thread and forwarded over Comch. */
 #define SRDMA_DPU_BAR_ID VFIO_ADMINQ_BAR0_ID
-#define SRDMA_DPU_BAR0_DB_OFFSET 0U
+#define SRDMA_DPU_BAR0_DB_OFFSET VFIO_ADMINQ_DB_REGION_OFFSET
 
 extern struct doca_dpa_app *srdma_doorbell_app;
 extern doca_dpa_func_t srdma_doorbell_thread;
@@ -66,8 +64,8 @@ struct srdma_backend_resources {
     doca_dpa_dev_uintptr_t dpa_thread_arg;
     struct doca_devemu_pci_db_completion *db_comp;
     doca_dpa_dev_devemu_pci_db_completion_t db_comp_handle;
-    struct doca_devemu_pci_db *db;
-    doca_dpa_dev_devemu_pci_db_t db_handle;
+    struct doca_devemu_pci_db *db[SRDMA_DB_TYPE_COUNT];
+    doca_dpa_dev_devemu_pci_db_t db_handle[SRDMA_DB_TYPE_COUNT];
     struct doca_dpa_completion *producer_comp;
     struct doca_comch_msgq *msgq;
     struct doca_comch_consumer *host_consumer;
@@ -84,17 +82,16 @@ struct srdma_backend_resources {
     uint32_t adminq_host_seq;
     uint64_t generation;
     struct doca_devemu_pci_msix *control_msix;
-    struct srdma_uar_ipc uar_ipc;
     struct srdma_admin admin;
     bool logger_ready;
     bool adminq_ready;
-    bool drop_initial_db_completion;
+    uint32_t initial_db_pending;
     bool pci_type_started;
     bool tlp_dev_started;
     bool dpa_started;
     bool dpa_thread_started;
     bool db_comp_started;
-    bool db_started;
+    bool db_started[SRDMA_DB_TYPE_COUNT];
     bool producer_comp_started;
     bool msgq_started;
     bool host_consumer_started;
@@ -107,6 +104,8 @@ struct srdma_dma_sync_state {
 };
 
 static struct srdma_backend_resources g_res;
+
+static doca_error_t process_adminq_pi(uint16_t producer);
 
 static void log_doca_error(const char *what, doca_error_t result)
 {
@@ -158,9 +157,7 @@ void srdma_backend_default_opts(struct srdma_backend_opts *opts)
     opts->pci_type_name = SRDMA_DPU_DEFAULT_PCI_TYPE_NAME;
     opts->vhca_id = SRDMA_DPU_DEFAULT_VHCA_ID;
     opts->num_db = SRDMA_DPU_DEFAULT_DB_COUNT;
-    opts->db_id = SRDMA_DPU_DEFAULT_DB_ID;
     opts->local_dma_size = SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE;
-    opts->uar_ipc_path = SRDMA_UAR_IPC_DEFAULT_PATH;
 }
 
 static doca_error_t init_logging(void)
@@ -249,6 +246,10 @@ static doca_error_t configure_and_start_pci_type(
                                                 VFIO_ADMINQ_NUM_MSIX);
     if (result != DOCA_SUCCESS)
         return result;
+    result = doca_devemu_pci_type_set_num_db(pci_type,
+                                              VFIO_ADMINQ_DB_COUNT);
+    if (result != DOCA_SUCCESS)
+        return result;
 
     result = doca_devemu_pci_type_set_memory_bar_conf(
         pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE,
@@ -273,15 +274,12 @@ static doca_error_t configure_and_start_pci_type(
         return result;
     }
 
-    for (uint32_t i = 0; i < VFIO_ADMINQ_UAR_REGION_COUNT; i++) {
-        result = doca_devemu_pci_tlp_type_set_bar_transaction_region_conf(
-            pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
-            VFIO_ADMINQ_UAR_BASE_OFFSET +
-                (uint64_t)i * VFIO_ADMINQ_UAR_REGION_SIZE,
-            VFIO_ADMINQ_UAR_REGION_SIZE);
-        if (result != DOCA_SUCCESS)
-            return result;
-    }
+    result = doca_devemu_pci_type_set_bar_db_region_by_offset_conf(
+        pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
+        VFIO_ADMINQ_DB_REGION_OFFSET, VFIO_ADMINQ_DB_REGION_SIZE,
+        VFIO_ADMINQ_DB_LOG_SIZE, VFIO_ADMINQ_DB_STRIDE_LOG_SIZE);
+    if (result != DOCA_SUCCESS)
+        return result;
 
     result = doca_devemu_pci_type_set_bar_msix_table_region_conf(
         pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET,
@@ -369,10 +367,16 @@ static doca_error_t create_started_tlp_endpoint(uint16_t num_db)
     }
 
     ep = doca_devemu_pci_tlp_dev_as_ep(g_res.tlp_dev);
-    (void)num_db;
-    result = doca_devemu_pci_ep_set_num_msix(ep, VFIO_ADMINQ_NUM_MSIX);
+    if (num_db != VFIO_ADMINQ_DB_COUNT)
+        return DOCA_ERROR_INVALID_VALUE;
+    result = doca_devemu_pci_ep_set_num_db(ep, num_db);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to configure endpoint doorbell count", result);
+        return result;
+    }
+    result = doca_devemu_pci_ep_set_num_msix(ep, VFIO_ADMINQ_NUM_MSIX);
+    if (result != DOCA_SUCCESS) {
+        log_doca_error("failed to configure endpoint MSI-X count", result);
         return result;
     }
 
@@ -658,7 +662,7 @@ static void dump_adminq_text(const char *label,
     printf("%s\"%.*s\"", label, SRDMA_ADMINQ_TEST_TEXT_LEN, text);
 }
 
-static doca_error_t srdma_backend_handle_adminq_doorbell(
+static doca_error_t __attribute__((unused)) srdma_backend_handle_adminq_doorbell(
     struct srdma_backend_resources *res)
 {
     struct srdma_adminq_test_msg *msg = res->local_dma_buf;
@@ -738,17 +742,24 @@ static void doorbell_recv_cb(
     if (imm != NULL && imm_len >= sizeof(msg)) {
         memcpy(&msg, imm, sizeof(msg));
         if (msg.type == SRDMA_DB_MSG_HOST_DB) {
-            if (res->drop_initial_db_completion && msg.db_value == 0) {
-                res->drop_initial_db_completion = false;
-                DOCA_LOG_INFO("ignored initial SRDMA doorbell value 0");
+            uint32_t db_id = (uint32_t)msg.user_data;
+            uint32_t payload = msg.db_value & SRDMA_DB_VALUE_MASK;
+
+            if (db_id >= SRDMA_DB_TYPE_COUNT) {
+                DOCA_LOG_WARN("received invalid SRDMA doorbell id=%u", db_id);
+            } else if ((res->initial_db_pending & (UINT32_C(1) << db_id)) != 0 &&
+                       msg.db_value == 0) {
+                res->initial_db_pending &= ~(UINT32_C(1) << db_id);
+                DOCA_LOG_INFO("ignored initial SRDMA doorbell id=%u value=0",
+                              db_id);
             } else {
-                res->drop_initial_db_completion = false;
+                res->initial_db_pending &= ~(UINT32_C(1) << db_id);
                 res->doorbells_received++;
-                printf("doorbell received: db_id=%" PRIu64 " value=%u\n",
-                       msg.user_data, msg.db_value);
-                result = srdma_backend_handle_adminq_doorbell(res);
+                printf("doorbell received: db_id=%u value=0x%04x payload=0x%04x\n",
+                       db_id, msg.db_value, payload);
+                result = process_adminq_pi(payload & UINT16_MAX);
                 if (result != DOCA_SUCCESS) {
-                    printf("adminq DMA exchange failed: %s\n",
+                    printf("AdminQ doorbell processing failed: %s\n",
                            doca_error_get_descr(result));
                 }
                 fflush(stdout);
@@ -872,7 +883,7 @@ static doca_error_t setup_dpa_context(void)
     }
 
     result = doca_devemu_pci_db_completion_set_max_num_dbs(
-        g_res.db_comp, SRDMA_DB_MAX_MSGS);
+        g_res.db_comp, SRDMA_DB_TYPE_COUNT);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to set DB completion capacity", result);
         return result;
@@ -1080,7 +1091,7 @@ static doca_error_t run_dpa_doorbell_thread(void)
     return DOCA_SUCCESS;
 }
 
-static doca_error_t __attribute__((unused)) setup_doorbell_transport(void)
+static doca_error_t setup_doorbell_transport(void)
 {
     doca_error_t result;
 
@@ -1097,7 +1108,16 @@ static doca_error_t __attribute__((unused)) setup_doorbell_transport(void)
     return run_dpa_doorbell_thread();
 }
 
-static doca_error_t __attribute__((unused)) create_doorbell(uint32_t db_id)
+static uint32_t doorbell_hw_id(uint32_t db_id)
+{
+    static const uint32_t hw_ids[SRDMA_DB_TYPE_COUNT] = {
+        [SRDMA_DB_ADMINQ] = SRDMA_DB_HW_ADMINQ,
+    };
+
+    return hw_ids[db_id];
+}
+
+static doca_error_t create_doorbell(uint32_t db_id)
 {
     struct doca_devemu_pci_ep *ep;
     uint64_t rpc_ret;
@@ -1106,20 +1126,21 @@ static doca_error_t __attribute__((unused)) create_doorbell(uint32_t db_id)
     ep = doca_devemu_pci_tlp_dev_as_ep(g_res.tlp_dev);
     result = doca_devemu_pci_ep_create_db_on_dpa(
         ep, g_res.db_comp, SRDMA_DPU_BAR_ID, SRDMA_DPU_BAR0_DB_OFFSET,
-        db_id, db_id, &g_res.db);
+        doorbell_hw_id(db_id), db_id, &g_res.db[db_id]);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to create SRDMA doorbell on DPA", result);
         return result;
     }
 
-    result = doca_devemu_pci_db_get_dpa_handle(g_res.db, &g_res.db_handle);
+    result = doca_devemu_pci_db_get_dpa_handle(g_res.db[db_id],
+                                                &g_res.db_handle[db_id]);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to get SRDMA doorbell DPA handle", result);
         return result;
     }
 
     result = doca_dpa_rpc(g_res.dpa, &srdma_doorbell_bind_db_rpc, &rpc_ret,
-                          g_res.db_comp_handle, g_res.db_handle);
+                          g_res.db_comp_handle, g_res.db_handle[db_id]);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to bind SRDMA doorbell on DPA", result);
         return result;
@@ -1129,16 +1150,29 @@ static doca_error_t __attribute__((unused)) create_doorbell(uint32_t db_id)
         return DOCA_ERROR_BAD_STATE;
     }
 
-    g_res.drop_initial_db_completion = true;
-    result = doca_devemu_pci_db_start(g_res.db);
+    g_res.initial_db_pending |= UINT32_C(1) << db_id;
+    result = doca_devemu_pci_db_start(g_res.db[db_id]);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to start SRDMA doorbell", result);
         return result;
     }
-    g_res.db_started = true;
+    g_res.db_started[db_id] = true;
 
-    DOCA_LOG_INFO("SRDMA doorbell listening on BAR%u offset=0x%x db_id=%u",
-                  SRDMA_DPU_BAR_ID, SRDMA_DPU_BAR0_DB_OFFSET, db_id);
+    DOCA_LOG_INFO("SRDMA doorbell listening on BAR%u region=0x%x db_id=%u hw_id=%u",
+                  SRDMA_DPU_BAR_ID, SRDMA_DPU_BAR0_DB_OFFSET, db_id,
+                  doorbell_hw_id(db_id));
+    return DOCA_SUCCESS;
+}
+
+static doca_error_t create_doorbells(void)
+{
+    doca_error_t result;
+
+    for (uint32_t db_id = 0; db_id < SRDMA_DB_TYPE_COUNT; db_id++) {
+        result = create_doorbell(db_id);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
     return DOCA_SUCCESS;
 }
 
@@ -1148,7 +1182,7 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
 
     if (opts == NULL || opts->pci_addr == NULL || opts->pci_type_name == NULL ||
         opts->local_dma_size < SRDMA_ADMIN_ENTRY_SIZE ||
-        opts->uar_ipc_path == NULL) {
+        opts->num_db != VFIO_ADMINQ_DB_COUNT) {
         return DOCA_ERROR_INVALID_VALUE;
     }
 
@@ -1168,10 +1202,7 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
     g_res.adminq_rx_pi = 0;
     g_res.generation = opts->generation;
     g_res.adminq_ready = false;
-    g_res.uar_ipc.shm_fd = -1;
-    g_res.uar_ipc.socket_fd = -1;
-    g_res.uar_ipc.peer_fd = -1;
-    g_res.uar_ipc.event_fd = -1;
+    g_res.initial_db_pending = 0;
     srdma_admin_init(&g_res.admin, (uint32_t)g_res.generation);
 
     result = find_supported_tlp_device(opts->pci_addr, &g_res.dev);
@@ -1206,18 +1237,20 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
         goto fail;
     }
 
+    result = setup_doorbell_transport();
+    if (result != DOCA_SUCCESS)
+        goto fail;
+
+    result = create_doorbells();
+    if (result != DOCA_SUCCESS)
+        goto fail;
+
     result = doca_devemu_pci_ep_create_msix(
         doca_devemu_pci_tlp_dev_as_ep(g_res.tlp_dev),
         VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET, 0,
         &g_res.control_msix);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to create control MSI-X", result);
-        goto fail;
-    }
-
-    if (srdma_uar_ipc_consumer_init(&g_res.uar_ipc,
-                                    opts->uar_ipc_path) != 0) {
-        result = DOCA_ERROR_IO_FAILED;
         goto fail;
     }
 
@@ -1346,28 +1379,6 @@ static doca_error_t process_adminq_pi(uint16_t producer)
 
 doca_error_t srdma_backend_progress(void)
 {
-    struct srdma_uar_event event;
-    uint64_t notifications;
-    int pop_result;
-
-    if (g_res.uar_ipc.event_fd >= 0)
-        while (read(g_res.uar_ipc.event_fd, &notifications,
-                    sizeof(notifications)) < 0 && errno == EINTR) {
-        }
-    while ((pop_result = srdma_uar_ipc_pop(&g_res.uar_ipc, &event)) > 0) {
-        if (event.generation != g_res.generation)
-            continue;
-        g_res.doorbells_received++;
-        if (event.uctx_id == 0 && event.offset == SRDMA_UAR_ADMINQ_DB &&
-            event.width == 4) {
-            doca_error_t result = process_adminq_pi(event.value & 0xffffU);
-            if (result != DOCA_SUCCESS)
-                return result;
-        }
-        /* AEQ/CEQ/CQ/SQ doorbells are tracked but do not drive data plane. */
-    }
-    if (pop_result < 0 || srdma_uar_ipc_is_fatal(&g_res.uar_ipc))
-        return DOCA_ERROR_BAD_STATE;
     if (g_res.pe == NULL) {
         return DOCA_SUCCESS;
     }
@@ -1389,40 +1400,38 @@ void srdma_backend_cleanup(void)
     g_res.adminq_tx_depth = 0;
     g_res.adminq_host_seq = 0;
 
-    srdma_uar_ipc_cleanup(&g_res.uar_ipc);
     if (g_res.control_msix != NULL) {
         result = doca_devemu_pci_msix_destroy(g_res.control_msix);
         if (result != DOCA_SUCCESS)
             log_doca_error("failed to destroy control MSI-X", result);
         g_res.control_msix = NULL;
     }
-    if (g_res.db != NULL) {
-        if (g_res.db_started) {
-            result = doca_devemu_pci_db_stop(g_res.db);
-            if (result != DOCA_SUCCESS && result != DOCA_ERROR_BAD_STATE) {
+    for (uint32_t db_id = SRDMA_DB_TYPE_COUNT; db_id-- > 0;) {
+        if (g_res.db[db_id] == NULL)
+            continue;
+        if (g_res.db_started[db_id]) {
+            result = doca_devemu_pci_db_stop(g_res.db[db_id]);
+            if (result != DOCA_SUCCESS && result != DOCA_ERROR_BAD_STATE)
                 log_doca_error("failed to stop doorbell", result);
-            }
-            g_res.db_started = false;
+            g_res.db_started[db_id] = false;
         }
         if (g_res.dpa != NULL && g_res.db_comp_handle != 0 &&
-            g_res.db_handle != 0) {
+            g_res.db_handle[db_id] != 0) {
             uint64_t rpc_ret;
 
             result = doca_dpa_rpc(g_res.dpa, &srdma_doorbell_unbind_db_rpc,
                                   &rpc_ret, g_res.db_comp_handle,
-                                  g_res.db_handle);
-            if (result != DOCA_SUCCESS) {
+                                  g_res.db_handle[db_id]);
+            if (result != DOCA_SUCCESS)
                 log_doca_error("failed to unbind doorbell on DPA", result);
-            } else if (rpc_ret != SRDMA_DB_RPC_SUCCESS) {
-                DOCA_LOG_WARN("DPA rejected SRDMA doorbell unbind");
-            }
+            else if (rpc_ret != SRDMA_DB_RPC_SUCCESS)
+                DOCA_LOG_WARN("DPA rejected SRDMA doorbell %u unbind", db_id);
         }
-        result = doca_devemu_pci_db_destroy(g_res.db);
-        if (result != DOCA_SUCCESS) {
+        result = doca_devemu_pci_db_destroy(g_res.db[db_id]);
+        if (result != DOCA_SUCCESS)
             log_doca_error("failed to destroy doorbell", result);
-        }
-        g_res.db = NULL;
-        g_res.db_handle = 0;
+        g_res.db[db_id] = NULL;
+        g_res.db_handle[db_id] = 0;
     }
 
     if (g_res.dpa_producer != NULL) {

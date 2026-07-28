@@ -1,7 +1,7 @@
 # sRDMA Host 控制面测试
 
-`srdma_ctrl_test` 是一个不投递 WQE 的最小 libibverbs 程序，用于同时验证
-Host `srdma.ko` 和 `vfio_adminq` 后端的控制面。
+`srdma_ctrl_test` 是一个最小 libibverbs 程序，用于同时验证 Host `srdma.ko`
+和 `vfio_adminq` 后端的控制面及 AdminQ doorbell 路径。
 
 ## 覆盖范围
 
@@ -17,8 +17,8 @@ Host `srdma.ko` 和 `vfio_adminq` 后端的控制面。
 - 后端核对：比较测试前后的
   `/sys/kernel/debug/srdma/<BDF>/commands/<OP>/{n,failed}`。
 
-程序不会调用 `ibv_post_send()`、`ibv_post_recv()` 或 `ibv_poll_cq()`，因此不依赖
-当前尚未实现的数据面。
+程序不会调用 `ibv_post_send()`、`ibv_post_recv()`、`ibv_req_notify_cq()` 或
+`ibv_poll_cq()`，因此不依赖当前尚未实现的数据面及 CQ/SQ/RQ doorbell。
 
 为避免中断 Host 管理连接，程序不会主动 flap netdev，所以 `NETDEV_UP/DOWN` 不在
 单次测试范围；它们应在独立维护窗口通过现有驱动生命周期测试验证。同理，CEQ

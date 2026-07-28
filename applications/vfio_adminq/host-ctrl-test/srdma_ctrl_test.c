@@ -617,7 +617,6 @@ static int qp_to_rts(struct ibv_qp *qp, unsigned int port,
 	pass("QP RTR -> RTS", "state only; no WQE posted");
 	if (query_qp_state(qp, IBV_QPS_RTS))
 		return -1;
-
 	memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_ERR;
 	if (ibv_modify_qp(qp, &attr, IBV_QP_STATE)) {

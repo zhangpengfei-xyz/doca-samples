@@ -505,7 +505,6 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
 enum pci_fe_memory_bar {
     PCI_FE_MEMORY_NONE = 0,
     PCI_FE_MEMORY_BAR0,
-    PCI_FE_MEMORY_UAR,
 };
 
 static enum pci_fe_memory_bar memory_request_valid(
@@ -521,8 +520,7 @@ static enum pci_fe_memory_bar memory_request_valid(
     if (fe->bar0_base != 0 && address >= fe->bar0_base &&
         end <= fe->bar0_base + VFIO_ADMINQ_HOST_BAR0_SIZE) {
         *bar_offset = (uint32_t)(address - fe->bar0_base);
-        return *bar_offset >= VFIO_ADMINQ_UAR_BASE_OFFSET ?
-                   PCI_FE_MEMORY_UAR : PCI_FE_MEMORY_BAR0;
+        return PCI_FE_MEMORY_BAR0;
     }
     return PCI_FE_MEMORY_NONE;
 }
@@ -582,36 +580,6 @@ static void handle_memory_write(struct doca_devemu_pci_tlp_channel_req *req,
     bar = memory_request_valid(fe, address, length * 4U, &offset);
     if (length == 0 || length > TLP_MAX_DATA_DWORDS || data == NULL ||
         bar == PCI_FE_MEMORY_NONE) {
-        doca_devemu_pci_tlp_channel_req_complete_tlp(req, 0, fe->tlp_dev);
-        return;
-    }
-    if (bar == PCI_FE_MEMORY_UAR) {
-        uint32_t uar_offset = offset - VFIO_ADMINQ_UAR_BASE_OFFSET;
-        struct srdma_uar_event event = {
-            .endpoint_id = 0,
-            .uctx_id = uar_offset / VFIO_ADMINQ_UAR_PAGE_SIZE,
-            .offset = uar_offset % VFIO_ADMINQ_UAR_PAGE_SIZE,
-            .width = length * 4U,
-            .generation = fe->generation,
-        };
-        bool valid = false;
-
-        if (length == 1) {
-            event.value = data[0];
-            valid = event.offset == SRDMA_UAR_ADMINQ_DB ||
-                    event.offset == SRDMA_UAR_AEQ_DB;
-        } else if (length == 2) {
-            event.value = (uint64_t)data[0] | ((uint64_t)data[1] << 32);
-            valid = event.offset == SRDMA_UAR_CEQ_DB ||
-                    event.offset == SRDMA_UAR_CQ_DB ||
-                    event.offset == SRDMA_UAR_SQ_DB;
-        }
-        if (event.uctx_id <= VFIO_ADMINQ_UAR_MAX_ID && valid &&
-            srdma_uar_ipc_push(&fe->uar_ipc, &event) != 0) {
-            DOCA_LOG_ERR("UAR IPC ring full or unavailable; stopping endpoint");
-            srdma_uar_ipc_mark_fatal(&fe->uar_ipc);
-            request_stop(fe);
-        }
         doca_devemu_pci_tlp_channel_req_complete_tlp(req, 0, fe->tlp_dev);
         return;
     }
@@ -748,6 +716,12 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
         DOCA_LOG_ERR("set_num_msix failed: %s", doca_error_get_descr(result));
         return result;
     }
+    result = doca_devemu_pci_type_set_num_db(fe->pci_type,
+                                              VFIO_ADMINQ_DB_COUNT);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("set_num_db failed: %s", doca_error_get_descr(result));
+        return result;
+    }
     result = doca_devemu_pci_type_set_memory_bar_conf(
         fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE,
         DOCA_DEVEMU_PCI_BAR_MEM_TYPE_64_BIT, 0);
@@ -768,17 +742,14 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
         DOCA_LOG_ERR("BAR0 transaction region failed: %s", doca_error_get_descr(result));
         return result;
     }
-    for (uint32_t i = 0; i < VFIO_ADMINQ_UAR_REGION_COUNT; i++) {
-        result = doca_devemu_pci_tlp_type_set_bar_transaction_region_conf(
-            fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
-            VFIO_ADMINQ_UAR_BASE_OFFSET +
-                (uint64_t)i * VFIO_ADMINQ_UAR_REGION_SIZE,
-            VFIO_ADMINQ_UAR_REGION_SIZE);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("UAR transaction region %u failed: %s", i,
-                         doca_error_get_descr(result));
-            return result;
-        }
+    result = doca_devemu_pci_type_set_bar_db_region_by_offset_conf(
+        fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
+        VFIO_ADMINQ_DB_REGION_OFFSET, VFIO_ADMINQ_DB_REGION_SIZE,
+        VFIO_ADMINQ_DB_LOG_SIZE, VFIO_ADMINQ_DB_STRIDE_LOG_SIZE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("UAR doorbell region failed: %s",
+                     doca_error_get_descr(result));
+        return result;
     }
     result = doca_devemu_pci_type_set_bar_msix_table_region_conf(
         fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET,
@@ -926,6 +897,9 @@ static doca_error_t create_endpoint(struct pci_fe *fe)
     if (result != DOCA_SUCCESS)
         return result;
     ep = doca_devemu_pci_tlp_dev_as_ep(fe->tlp_dev);
+    result = doca_devemu_pci_ep_set_num_db(ep, VFIO_ADMINQ_DB_COUNT);
+    if (result != DOCA_SUCCESS)
+        return result;
     result = doca_devemu_pci_ep_set_num_msix(ep, VFIO_ADMINQ_NUM_MSIX);
     if (result != DOCA_SUCCESS)
         return result;
@@ -940,12 +914,11 @@ static doca_error_t create_endpoint(struct pci_fe *fe)
 
 doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
                          struct gemini_server *gemini,
-                         const uint8_t mac[6], const char *uar_ipc_path)
+                         const uint8_t mac[6])
 {
     doca_error_t result;
 
-    if (fe == NULL || pci_addr == NULL || gemini == NULL || mac == NULL ||
-        uar_ipc_path == NULL)
+    if (fe == NULL || pci_addr == NULL || gemini == NULL || mac == NULL)
         return DOCA_ERROR_INVALID_VALUE;
     memset(fe, 0, sizeof(*fe));
     fe->gemini = gemini;
@@ -953,9 +926,6 @@ doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
     memcpy(fe->mac, mac, sizeof(fe->mac));
     init_config_space(fe);
     reset_bar_state(fe);
-
-    if (srdma_uar_ipc_producer_init(&fe->uar_ipc, uar_ipc_path) != 0)
-        return DOCA_ERROR_IO_FAILED;
 
     result = find_tlp_device(pci_addr, &fe->dev);
     if (result != DOCA_SUCCESS)
@@ -982,7 +952,6 @@ void pci_fe_cleanup(struct pci_fe *fe)
     if (fe->state != PCI_FE_ABSENT)
         (void)pci_fe_unplug(fe, true);
     destroy_endpoint(fe);
-    srdma_uar_ipc_cleanup(&fe->uar_ipc);
     if (fe->channel_ctx != NULL && fe->channel_started) {
         doca_error_t result = doca_ctx_stop(fe->channel_ctx);
 
@@ -1026,7 +995,6 @@ void pci_fe_progress(struct pci_fe *fe)
         struct timespec now;
         uint64_t now_ns;
 
-        (void)srdma_uar_ipc_producer_progress(&fe->uar_ipc);
         if (fe->state == PCI_FE_STARTED &&
             clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
             now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;

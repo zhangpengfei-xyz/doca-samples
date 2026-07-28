@@ -6,7 +6,6 @@
 
 #include <doca_error.h>
 
-#include "../common/srdma_uar_ipc.h"
 #include "gemini_server.h"
 
 struct doca_ctx;
@@ -68,12 +67,11 @@ struct pci_fe {
     uint64_t generation;
     uint32_t heartbeat;
     uint64_t heartbeat_last_ns;
-    struct srdma_uar_ipc uar_ipc;
 };
 
 doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
                          struct gemini_server *gemini,
-                         const uint8_t mac[6], const char *uar_ipc_path);
+                         const uint8_t mac[6]);
 void pci_fe_cleanup(struct pci_fe *fe);
 void pci_fe_progress(struct pci_fe *fe);
 int pci_fe_plug(struct pci_fe *fe);

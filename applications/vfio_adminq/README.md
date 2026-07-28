@@ -5,15 +5,15 @@
 - [BASIC_DESIGN.md](BASIC_DESIGN.md)：已经实现的 v1 最小 VFIO AdminQ/DMA 闭环。
 - [SRDMA_DRIVER_DESIGN.md](SRDMA_DRIVER_DESIGN.md)：对接真实 `srdma.ko` 的 v2
   目标设计，包括单 BAR0、MSI-X、真实 AdminQ、EQ/CQ/QP 和数据面边界。
-- [host-ctrl-test/](host-ctrl-test/)：Host 侧无数据面的 libibverbs 控制面测试，
-  覆盖 UCTX、PD、MR、EQ、CQ、QP、GID、统计、健康及 AdminQ 计数核对。
+- [host-ctrl-test/](host-ctrl-test/)：Host 侧 libibverbs 控制面测试，覆盖 UCTX、PD、
+  MR、EQ、CQ、QP、GID、统计、健康和 AdminQ 计数。
 
 当前代码已实现 v2 控制面，并保留 v1 host emulator 作为低层故障注入工具：
 
-- `doca_vfio_adminq_pci_fe`：DPU PCI 前端，负责设备插拔、单 BAR0、TLP、UAR IPC 和
-  Gemini 服务端。
-- `doca_vfio_adminq_dev_be`：DPU 后端，负责 Gemini 客户端、AdminQ DMA、资源表和
-  MSI-X。
+- `doca_vfio_adminq_pci_fe`：DPU PCI 前端，负责设备插拔、单 BAR0、CFG TLP、
+  doorbell region 和 Gemini 服务端。
+- `doca_vfio_adminq_dev_be`：DPU 后端，负责 Gemini 客户端、AdminQ DMA、资源表、
+  AdminQ DPA doorbell completion 和 MSI-X。
 - `vfio_adminq_host_emu`：Host 侧 VFIO 测试程序，负责 AdminQ DMA/DB 闭环。
 
 v2 只支持一个 endpoint，提供 128-depth AdminQ、129 个 MSI-X vector 和

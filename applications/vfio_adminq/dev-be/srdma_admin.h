@@ -10,7 +10,7 @@
 #define SRDMA_ADMIN_MAX_MR 1024U
 #define SRDMA_ADMIN_MAX_CQ 1024U
 #define SRDMA_ADMIN_MAX_QP 1024U
-#define SRDMA_ADMIN_MAX_UCTX 48U
+#define SRDMA_ADMIN_MAX_UCTX 16U
 #define SRDMA_ADMIN_MAX_GID 128U
 
 struct srdma_admin_resource {

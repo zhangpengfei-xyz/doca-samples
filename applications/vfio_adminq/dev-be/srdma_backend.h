@@ -11,7 +11,6 @@
 #define SRDMA_DPU_DEFAULT_PCI_TYPE_NAME VFIO_ADMINQ_PCI_TYPE_NAME
 #define SRDMA_DPU_DEFAULT_VHCA_ID 7
 #define SRDMA_DPU_DEFAULT_DB_COUNT VFIO_ADMINQ_DB_COUNT
-#define SRDMA_DPU_DEFAULT_DB_ID VFIO_ADMINQ_DB_ID
 #define SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE 4096
 
 struct srdma_backend_opts {
@@ -19,10 +18,8 @@ struct srdma_backend_opts {
     const char *pci_type_name;
     uint16_t vhca_id;
     uint16_t num_db;
-    uint32_t db_id;
     size_t local_dma_size;
     uint32_t timeout_sec;
-    const char *uar_ipc_path;
     uint64_t generation;
 };
 

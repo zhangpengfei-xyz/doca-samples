@@ -27,7 +27,7 @@ dpa_code = custom_target(
 executable(
 	'doca_vfio_adminq_dev_be',
 	files('dev-be/main.c', 'dev-be/gemini_client.c', 'dev-be/srdma_backend.c',
-	      'dev-be/srdma_admin.c', 'common/srdma_uar_ipc.c') + dpa_code,
+	      'dev-be/srdma_admin.c') + dpa_code,
 	c_args: vfio_adminq_c_args,
 	dependencies: app_dependencies,
 	include_directories: vfio_adminq_inc_dirs,
@@ -36,8 +36,7 @@ executable(
 
 executable(
 	'doca_vfio_adminq_pci_fe',
-	files('pci-fe/main.c', 'pci-fe/pci_fe.c', 'pci-fe/gemini_server.c',
-	      'common/srdma_uar_ipc.c'),
+	files('pci-fe/main.c', 'pci-fe/pci_fe.c', 'pci-fe/gemini_server.c'),
 	c_args: vfio_adminq_c_args,
 	dependencies: app_dependencies,
 	include_directories: vfio_adminq_inc_dirs,
@@ -55,8 +54,7 @@ executable(
 
 srdma_control_test = executable(
 	'vfio_adminq_srdma_control_test',
-	files('tests/srdma_control_test.c', 'dev-be/srdma_admin.c',
-	      'common/srdma_uar_ipc.c'),
+	files('tests/srdma_control_test.c', 'dev-be/srdma_admin.c'),
 	c_args: vfio_adminq_c_args,
 	include_directories: vfio_adminq_inc_dirs,
 	install: false,
