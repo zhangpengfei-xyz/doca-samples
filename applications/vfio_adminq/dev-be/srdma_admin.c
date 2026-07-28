@@ -12,6 +12,9 @@ enum {
     SRDMA_QP_STATE_RTR = 2,
     SRDMA_QP_STATE_RTS = 3,
     SRDMA_QP_STATE_ERR = 6,
+    SRDMA_CAP_EXT_GET_CAP_EXT = 1U << 0,
+    SRDMA_CAP_EXT_HEALTH_CHECK = 1U << 1,
+    SRDMA_CAP_EXT_HEALTH_MAC_ONLY = 1U << 2,
 };
 
 static bool aligned(uint64_t value, uint64_t alignment)
@@ -70,9 +73,11 @@ static enum srdma_admin_rc get_cap(struct srdma_admin_entry *out)
     srdma_admin_set(out, 8, 20, 5, 12);
     srdma_admin_set(out, 8, 25, 4, 12);
     srdma_admin_set(out, 8, 29, 3, 2);
-    srdma_admin_set(out, 10, 12, 20, 1);
-    srdma_admin_set(out, 11, 12, 20, 1);
-    srdma_admin_set(out, 22, 0, 32, 1);
+    /* The zeroed PAL/MR page-size blacklists keep 4 KiB pages available. */
+    srdma_admin_set(out, 22, 0, 32,
+                    SRDMA_CAP_EXT_GET_CAP_EXT |
+                    SRDMA_CAP_EXT_HEALTH_CHECK |
+                    SRDMA_CAP_EXT_HEALTH_MAC_ONLY);
     return SRDMA_ADMIN_RC_SUCC;
 }
 

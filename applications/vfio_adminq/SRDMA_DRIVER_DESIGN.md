@@ -319,6 +319,8 @@ GET_CAP 必须只暴露后端真正实现的能力，不得照抄实物设备的
 - RC/GSI；UD、SRQ、atomic capability 均清零。
 - `cap_ext.bit0=1`，支持 GET_CAP_EXT。
 - 只有实现稳定 heartbeat/keepalive 后才置 `cap_ext.bit1`。
+- `cap_ext.bit2=1` 表示健康寄存器只实现 heartbeat 和 MAC 状态，offload/switch
+  状态仅为信息项。
 - `GET_CAP_EXT.max_eq=128`，其余资源上限应按 DPU 内存预算取保守值。
 
 ## 7. 资源模型
@@ -429,7 +431,8 @@ ping-pong 或跨机 RC 通信列为验收通过项。未来若接入 transport e
 - 仍被引用返回 `RESOURCE_BUSY`。
 - 只有无法继续保证 ring/DMA 一致性时返回 `FATAL_ERR`。
 
-heartbeat 在 endpoint STARTED 后单调递增。HEALTH_H 的 offload-alive bit 保持 0。
+heartbeat 在 endpoint STARTED 后单调递增。HEALTH_H 的 offload-alive bit 保持 0；
+后端同时置 `cap_ext.bit2`，避免 Host 将未实现的 offload/switch 状态判为设备故障。
 DMA error、非法 RX owner 和 IPC overflow 必须停止新工作，写入 AEQ/device health，
 并允许 Host 进入 broken 流程。
 

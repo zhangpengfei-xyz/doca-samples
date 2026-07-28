@@ -44,6 +44,9 @@ DOCA_LOG_REGISTER(VFIO_ADMINQ_PCI_FE);
 #define PCI_BAR0_LOW_MASK 0xfffc0000U
 #define PCI_CONFIG_DWORDS (sizeof(((struct pci_fe *)0)->config_space) / 4U)
 
+#define SRDMA_HEALTH_MAC0_ALIVE (1U << 0)
+#define SRDMA_HEALTH_MAC1_ALIVE (1U << 1)
+
 #define TLP_FMT_3DW_NODATA 0x0U
 #define TLP_FMT_4DW_NODATA 0x1U
 #define TLP_FMT_3DW_W_DATA 0x2U
@@ -199,10 +202,10 @@ static uint32_t bar0_read32(const struct pci_fe *fe, uint32_t offset)
     case SRDMA_BFA_PCI_MAX_VECTORS:
         return VFIO_ADMINQ_NUM_MSIX;
     case SRDMA_BFA_PCI_DEV_MACADDR:
-        return (uint32_t)fe->mac[0] | ((uint32_t)fe->mac[1] << 8) |
-               ((uint32_t)fe->mac[2] << 16) | ((uint32_t)fe->mac[3] << 24);
+        return (uint32_t)fe->mac[5] | ((uint32_t)fe->mac[4] << 8) |
+               ((uint32_t)fe->mac[3] << 16) | ((uint32_t)fe->mac[2] << 24);
     case SRDMA_BFA_PCI_DEV_MACADDR + 4:
-        return (uint32_t)fe->mac[4] | ((uint32_t)fe->mac[5] << 8);
+        return (uint32_t)fe->mac[1] | ((uint32_t)fe->mac[0] << 8);
     case SRDMA_BFA_PCI_DEV_CTRL:
         return 0;
     case SRDMA_BFA_PCI_DEV_STATUS:
@@ -230,7 +233,7 @@ static uint32_t bar0_read32(const struct pci_fe *fe, uint32_t offset)
     case SRDMA_BFA_PCI_DEV_DIAG + 8:
         return 1U;
     case SRDMA_BFA_PCI_DEV_DIAG + 12:
-        return 0x3U;
+        return SRDMA_HEALTH_MAC0_ALIVE | SRDMA_HEALTH_MAC1_ALIVE;
     default:
         if (offset >= SRDMA_BFA_PCI_DEV_DIAG &&
             offset < SRDMA_BFA_PCI_DEV_DIAG + SRDMA_BFA_PCI_DEV_DIAG_SIZE)
@@ -429,11 +432,33 @@ static bool config_target_valid(struct pci_fe *fe, const void *header)
     return true;
 }
 
+static bool config_capability(uint32_t reg, uint16_t *cap_id,
+                              uint8_t *is_pcie_cap)
+{
+    uint32_t offset = reg * 4U;
+
+    *is_pcie_cap = 0;
+    if (offset >= PCI_MSIX_CAP_OFFSET &&
+        offset < PCI_MSIX_CAP_OFFSET + 12U) {
+        *cap_id = PCI_MSIX_CAP_ID;
+        return true;
+    }
+    if (offset >= PCI_EXP_CAP_OFFSET &&
+        offset < PCI_EXP_CAP_OFFSET + PCI_EXP_CAP_LENGTH) {
+        *cap_id = PCI_EXP_CAP_ID;
+        return true;
+    }
+    return false;
+}
+
 static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
                               struct pci_fe *fe, const void *header,
                               enum pci_fe_tlp_kind kind)
 {
     uint32_t reg = GET_TLP_EXT_REG(header);
+    uint16_t cap_id = 0;
+    uint8_t is_pcie_cap = 0;
+    uint8_t is_cap_id_valid;
 
     if (!config_target_valid(fe, header) ||
         (kind != PCI_FE_TLP_CFGRD0 && kind != PCI_FE_TLP_CFGWR0)) {
@@ -441,6 +466,7 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
         return;
     }
 
+    is_cap_id_valid = config_capability(reg, &cap_id, &is_pcie_cap);
     if (kind == PCI_FE_TLP_CFGRD0) {
         uint32_t value = load_config_dword(fe, reg);
         void *data = doca_devemu_pci_tlp_channel_req_get_tlp_cpl_data(req);
@@ -456,7 +482,9 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
                               4, 0);
         doca_devemu_pci_tlp_channel_req_complete_config_read(req,
                                                               fe->tlp_dev,
-                                                              0, 0, 0);
+                                                              is_cap_id_valid,
+                                                              cap_id,
+                                                              is_pcie_cap);
     } else {
         const uint32_t *data = doca_devemu_pci_tlp_channel_req_get_tlp_data(req);
 
@@ -468,7 +496,9 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
         set_completion_header(req, fe, header, 0, 0, TLP_CPL_STATUS_SC, 4, 0);
         doca_devemu_pci_tlp_channel_req_complete_config_write(req,
                                                                fe->tlp_dev,
-                                                               0, 0, 0);
+                                                               is_cap_id_valid,
+                                                               cap_id,
+                                                               is_pcie_cap);
     }
 }
 
@@ -993,9 +1023,22 @@ void pci_fe_cleanup(struct pci_fe *fe)
 void pci_fe_progress(struct pci_fe *fe)
 {
     if (fe != NULL) {
+        struct timespec now;
+        uint64_t now_ns;
+
         (void)srdma_uar_ipc_producer_progress(&fe->uar_ipc);
-        if (fe->state == PCI_FE_STARTED)
-            fe->heartbeat++;
+        if (fe->state == PCI_FE_STARTED &&
+            clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
+            if (fe->heartbeat_last_ns == 0)
+                fe->heartbeat_last_ns = now_ns;
+            while (now_ns - fe->heartbeat_last_ns >= UINT64_C(500000000)) {
+                fe->heartbeat++;
+                fe->heartbeat_last_ns += UINT64_C(500000000);
+            }
+        } else if (fe->state != PCI_FE_STARTED) {
+            fe->heartbeat_last_ns = 0;
+        }
     }
     if (fe != NULL && fe->pe != NULL)
         while (doca_pe_progress(fe->pe) != 0) {

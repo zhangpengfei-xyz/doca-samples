@@ -1339,8 +1339,7 @@ static doca_error_t process_adminq_pi(uint16_t producer)
         if (result != DOCA_SUCCESS)
             return result;
         g_res.adminq_rx_pi++;
-        if (g_res.control_msix != NULL)
-            doca_devemu_pci_msix_raise(g_res.control_msix);
+        doca_devemu_pci_msix_raise(g_res.control_msix);
     }
     return DOCA_SUCCESS;
 }
@@ -1397,7 +1396,6 @@ void srdma_backend_cleanup(void)
             log_doca_error("failed to destroy control MSI-X", result);
         g_res.control_msix = NULL;
     }
-
     if (g_res.db != NULL) {
         if (g_res.db_started) {
             result = doca_devemu_pci_db_stop(g_res.db);
