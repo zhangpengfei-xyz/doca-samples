@@ -5,7 +5,8 @@
 本文定义 `applications/vfio_adminq` 从最小 VFIO AdminQ 闭环升级为可被
 `srdma.ko` 驱动使用的设备模拟方案。
 
-- Host 驱动基线：`/root/ByteDance/srdma/host/kernel` commit `3ad39c00`。
+- Host 驱动基线：`/root/ByteDance/srdma/host/kernel` commit `a00bd15d`，并增加
+  本文定义的单 BAR fallback。
 - 驱动 ABI 基线：`/root/ByteDance/srdma/host/kernel/ADMINQ_ABI.md`。
 - DOCA 基线：3.4.0302，BF3 emulation manager `0000:03:00.0`。
 - PCI ID：`1e93:006a`。
@@ -21,15 +22,15 @@ DOCA object 组合以 2026-07-24 的 BF3 实机验证结果为准。
 
 v2 采用以下确定方案：
 
-1. BAR0 从真实设备的 8 KiB 扩大到 16 KiB。驱动仍只映射前 4 KiB，扩容对
-   `srdma.ko` 透明；额外空间用于满足 DOCA 对 MSI-X table 和 PBA 各占独立
-   4 KiB region 的要求。
-2. BAR2 从真实设备的 512 KiB 减小到 256 KiB，共 64 个 4 KiB UAR page。
-   驱动直接从 BAR2 resource length 得到 UAR page 数，无需修改驱动。
+1. 受 DOCA 3.4 实机能力限制，设备只暴露一块 256 KiB 64-bit BAR0。CFG、MSI-X
+   table/PBA 和 UAR 共用 BAR0；`srdma.ko` 增加单 BAR fallback，并保留现有
+   BAR0/BAR2 与 legacy BAR2/BAR4 兼容路径。
+2. UAR 从 BAR0 `0x10000` 开始，共 48 个 4 KiB page，恰好由三个 64 KiB
+   transaction region 覆盖。
 3. 暴露 129 个 MSI-X vector：vector 0 为 AdminQ/AEQ control vector，vector
    1..128 为 CEQ completion vector。
 4. 删除 v1 的 256 B 测试消息语义，改为真实的双 128-depth AdminQ DMA ring。
-5. 使用 TLP-only 方案：BAR0 CFG 占用 1 个 transaction region，BAR2 的
+5. 使用 TLP-only 方案：BAR0 CFG 占用 1 个 transaction region，BAR0 UAR 的
    32-bit 和 64-bit doorbell 由其余 3 个 transaction region 处理；不使用
    stateful region，也不依赖只能保存最多 32-bit value 的 DOCA DB object。
 6. 首版保持单 endpoint，但必须支持多 AdminQ outstanding、多个 PD/MR/EQ/CQ/QP
@@ -43,26 +44,26 @@ v2 采用以下确定方案：
 
 | 项目 | 实测值 | v2 使用值 |
 | --- | ---: | ---: |
-| 可配置 BAR 数 | 2 | 2 |
-| BAR 最小/最大 `log2(size)` | 12 / 30 | BAR0=14，BAR2=18 |
+| 可配置 BAR 数 | 2 | 1 |
+| BAR 最小/最大 `log2(size)` | 12 / 30 | BAR0=18 |
 | MSI-X 最大数 | 256 | 129 |
 | DB 最大数 | 256 | 首版不作为 64-bit UAR 主路径 |
 | 单 DB 最大宽度 | 4 B | UAR 有 8 B write，不能直接使用 |
 | MSI-X table region | 1 × 4 KiB | 1 × 4 KiB |
 | MSI-X PBA region | 1 × 4 KiB | 1 × 4 KiB |
 | 单 transaction region 最大值 | 64 KiB | 64 KiB |
-| transaction region 总数 | 4 | BAR0 使用 1 个，BAR2 使用 3 个 |
+| transaction region 总数 | 4 | BAR0 CFG 使用 1 个，UAR 使用 3 个 |
 | stateful region | 1 × 256 B | 不使用；与 TLP type 组合被 SDK 拒绝 |
 
-BAR0 和 BAR2 的 Host-visible BIR 必须分别为 0 和 2。DOCA API 的 BAR selector
-与 Host PCI BIR 的对应关系必须在 type 启动前查询并断言；不能仅根据参数值
-猜测第二块 64-bit BAR 的 BIR。
+额外 type probe 表明，当前 SDK 只有“BAR0 64-bit + BAR1 disabled”能稳定启动；
+同时启用 BAR0 与 BAR2 会在 type start 阶段失败。因此 v2 固定使用单 BAR，
+Host-visible BIR 为 0。
 
 ## 3. 总体架构
 
 ```mermaid
 flowchart LR
-    K["Host srdma.ko"] -->|"PCI config / BAR0 / BAR2 TLP"| F["pci-fe"]
+    K["Host srdma.ko"] -->|"PCI config / BAR0 TLP"| F["pci-fe"]
     K <-->|"DMA: AdminQ / EQ / CQ / MR metadata"| B
     F -->|"START / STOP / FLR IPC"| B
     F -->|"UAR shared-memory SPSC ring + eventfd"| B
@@ -74,7 +75,7 @@ flowchart LR
 `pci-fe` 负责：
 
 - PCI type、representor、endpoint 和 Host-visible config space。
-- BAR0 CFG 和 BAR2 UAR transaction TLP 的解析与 completion。
+- BAR0 CFG 和 UAR transaction TLP 的解析与 completion。
 - START/STOP/FLR/bus-master-clear 状态机。
 - 把 START/STOP/FLR 等生命周期事件以及完整的 32/64-bit UAR write 可靠传给
   `dev-be`。
@@ -107,21 +108,22 @@ flowchart LR
 
 PCI config space 至少提供：
 
-- BAR0 和 BAR2 两块 64-bit memory BAR；二者均为 non-prefetchable。
+- 一块 256 KiB 64-bit non-prefetchable BAR0。
 - PCI Express endpoint capability 和 FLR。
 - MSI-X capability，table BIR 指向 BAR0 `0x1000`，PBA BIR 指向 BAR0
   `0x2000`，table size 字段为 128，即 129 vectors。
 - 正确的 command register Memory Space 和 Bus Master 语义。
 
-### 4.2 BAR0：16 KiB
+### 4.2 BAR0：256 KiB
 
 ```text
-BAR0 0x0000..0x3fff
+BAR0 0x00000..0x3ffff
 
-0x0000..0x0fff  CFG window，驱动仅映射这一页
-0x1000..0x1fff  DOCA MSI-X table region
-0x2000..0x2fff  DOCA MSI-X PBA region
-0x3000..0x3fff  reserved，读 0、写忽略
+0x00000..0x00fff  CFG window，驱动仅映射这一页
+0x01000..0x01fff  DOCA MSI-X table region
+0x02000..0x02fff  DOCA MSI-X PBA region
+0x03000..0x0ffff  reserved，读 0、写忽略
+0x10000..0x3ffff  48 个 UAR page
 ```
 
 BAR0 `0x0000..0x0fff` 配置为一个 transaction region，由 `pci-fe` 处理 Host
@@ -146,15 +148,15 @@ MMIO read/write TLP，并在设备状态变化时返回动态值。BAR0 CFG 寄�
 `NDEV_ADDR` 必须由命令行或 endpoint 配置传入，不再使用 v1 固定测试 MAC。
 找不到相同 permanent MAC 的 Host netdev 时，驱动会延迟 probe。
 
-### 4.3 BAR2：256 KiB
+### 4.3 BAR0 UAR window
 
-BAR2 包含 64 个 UAR page：
+BAR0 的 `0x10000..0x3ffff` 包含 48 个 UAR page：
 
 ```text
-UAR address = BAR2 base + (uctx_id << 12)
+UAR address = BAR0 base + 0x10000 + (uctx_id << 12)
 uctx_id 0      kernel reserved page
 uctx_id 1..47  可分配的 user context page
-uctx_id 48..63 Host BAR 中可见但后端不覆盖，ALLOC_UCTX 返回 NO_RESOURCE
+uctx_id >= 48  ALLOC_UCTX 返回 NO_RESOURCE
 ```
 
 每页 doorbell layout：
@@ -180,12 +182,12 @@ transaction region 分配为：
 | Region | BAR | 范围 | 用途 |
 | --- | ---: | --- | --- |
 | transaction 0 | BAR0 | `0x0000..0x0fff` | CFG registers |
-| transaction 1 | BAR2 | `0x00000..0x0ffff` | UAR page 0..15 |
-| transaction 2 | BAR2 | `0x10000..0x1ffff` | UAR page 16..31 |
-| transaction 3 | BAR2 | `0x20000..0x2ffff` | UAR page 32..47 |
+| transaction 1 | BAR0 | `0x10000..0x1ffff` | UAR page 0..15 |
+| transaction 2 | BAR0 | `0x20000..0x2ffff` | UAR page 16..31 |
+| transaction 3 | BAR0 | `0x30000..0x3ffff` | UAR page 32..47 |
 
-`ALLOC_UCTX` 只允许 id 1..47；id 48..63 稳定返回 `NO_RESOURCE`。后端不得为未覆盖
-page 创建 context，也不得访问 BAR2 `0x30000..0x3ffff`。
+`ALLOC_UCTX` 只允许 id 1..47；更大的 id 稳定返回 `NO_RESOURCE`。后端不得为未覆盖
+page 创建 context。
 
 ### 4.5 Mixed-type 实机验证结论
 
@@ -203,9 +205,11 @@ generic_type + transaction_region: 2 (Operation not permitted)
 `doca_devemu_pci_type_create()` 创建 generic type，再调用
 `doca_devemu_pci_tlp_type_set_bar_transaction_region_conf()`。两条路径都在 type
 配置阶段返回 `DOCA_ERROR_NOT_PERMITTED`，早于 representor 和 endpoint handle 创建。
-因此不存在一个能同时声明 BAR0 stateful region 与 BAR2 transaction region 的 type，
+因此不存在一个能同时声明 BAR0 stateful region 与另一 transaction region 的 type，
 也就无法在其同一 representor 上建立所需的 `pci_dev`/`tlp_dev` 混合方案。v2 固定采用
-上述 TLP-only 布局，不再把 mixed-handle 作为运行时探测或回退分支。
+上述 TLP-only 布局，不再把 mixed-handle 作为运行时探测或回退分支。随后对 BAR
+组合的最小探针进一步确认：单独启用 64-bit BAR0 时必须显式禁用其高位槽 BAR1，
+该组合启动成功；启用 BAR0 与 BAR2 的双 BAR组合在同一设备和 SDK 上启动失败。
 
 ## 5. 设备生命周期
 
@@ -402,7 +406,7 @@ event ring 必须满足：
 - STOP/FLR 通过 generation 隔离旧事件。
 
 Gemini 继续承担 PLUG/START/STOP/UNPLUG 控制消息。TLP-only 方案由 `pci-fe` 完成
-BAR2 TLP，并通过 shared-memory SPSC ring + eventfd 把上述结构转给 `dev-be`。
+BAR0 UAR TLP，并通过 shared-memory SPSC ring + eventfd 把上述结构转给 `dev-be`。
 高频 doorbell 不得逐条等待同步 Gemini reply。
 
 ## 10. 数据面范围边界
@@ -436,10 +440,10 @@ Host 提供的所有 IOVA、PAL、MAL、MTT、depth 和 offset 都是不可信�
 
 ### 阶段 A：PCI layout 和 probe
 
-- BAR0=16 KiB、BAR2=256 KiB、129 MSI-X。
-- 使用已实机确认的 TLP-only 布局：BAR0 1 个、BAR2 3 个 transaction region。
+- BAR0=256 KiB、129 MSI-X；修改后的驱动使用 BAR0 `0x10000` UAR fallback。
+- 使用已实机确认的 TLP-only 布局：BAR0 CFG 1 个、UAR 3 个 transaction region。
 - BAR0 CFG、NDEV_ADDR、START/STOP、DEV_READY/DEV_STA。
-- BAR2 page 0 AdminQ/AEQ/CEQ/CQ/SQ doorbell TLP。
+- BAR0 UAR page 0 AdminQ/AEQ/CEQ/CQ/SQ doorbell TLP。
 - Host `lspci -vv`、BAR resource、MSI-X allocation 和驱动 probe 成功。
 
 ### 阶段 B：真实 AdminQ
@@ -466,7 +470,7 @@ Host 提供的所有 IOVA、PAL、MAL、MTT、depth 和 offset 都是不可信�
 ### 13.1 PCI 和 probe
 
 - Host 枚举 `1e93:006a`。
-- BAR0 resource 为 16 KiB，BAR2 为 256 KiB。
+- BAR0 resource 为 256 KiB，不暴露 BAR2 resource。
 - MSI-X table size 为 129，Host 成功一次性分配 129 vectors。
 - `srdma.ko` probe 后出现 RDMA device，且绑定正确 netdev。
 
@@ -474,7 +478,7 @@ Host 提供的所有 IOVA、PAL、MAL、MTT、depth 和 offset 都是不可信�
 
 - 128-depth TX/RX 连续 wrap 1000 次无丢失或覆盖。
 - 至少 64 个并发 command ID 可乱序完成。
-- UCTX id 1..47 可用，48..63 稳定返回 `NO_RESOURCE`。
+- UCTX id 1..47 可用，>=48 稳定返回 `NO_RESOURCE`。
 - PD/MR/EQ/CQ/QP 创建、查询、销毁和错误回滚无泄漏。
 - vector 0 的 `/proc/interrupts` 计数符合 AdminQ/AEQ 事件数；CEQ vectors 能完成
   分配，但本项目不伪造数据 completion 来增加其中断计数。
@@ -508,8 +512,8 @@ Host 提供的所有 IOVA、PAL、MAL、MTT、depth 和 offset 都是不可信�
 | 当前代码 | v2 改造 |
 | --- | --- |
 | `common/vfio_adminq_abi.h` | 拆分 PCI/Gemini ABI 与真实 `srdma_hw` ABI，增加静态布局测试 |
-| `pci-fe/pci_fe.c` | 双 BAR、MSI-X、4 个 TLP region、BAR0 CFG、BAR2 UAR 和生命周期 IPC |
-| `pci-fe/pci_fe.h` | endpoint state、双 BAR base、generation、MSI-X 和 UAR IPC 配置 |
+| `pci-fe/pci_fe.c` | 单 BAR、MSI-X、4 个 TLP region、BAR0 CFG/UAR 和生命周期 IPC |
+| `pci-fe/pci_fe.h` | endpoint state、BAR0 base、generation、MSI-X 和 UAR IPC 配置 |
 | `dev-be/srdma_backend.c` | 删除测试消息，新增异步 DMA、AdminQ、UAR IPC、资源表、EQ/CQ/QP |
 | `dev-be/dpa/doorbell_dev.c` | 首版不作为 64-bit UAR 主路径；保留给可证明安全的 32-bit 优化 |
 | `gemini_client/server` | 控制面保持 v5，传递生命周期和 endpoint generation |

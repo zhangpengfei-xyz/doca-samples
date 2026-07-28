@@ -35,6 +35,7 @@ static void usage(const char *prog)
 {
     printf("Usage:\n"
            "  %s serve [--pci-addr <addr>] [--gemini-socket <path>] "
+           "--netdev-mac <xx:xx:xx:xx:xx:xx> [--uar-ipc <path>] "
            "[--control-socket <path>]\n"
            "  %s plug|unplug|status [--control-socket <path>]\n",
            prog, prog);
@@ -170,8 +171,23 @@ static int send_control_command(const char *path, const char *command)
     return strncmp(reply, "OK", 2) == 0 ? 0 : 1;
 }
 
+static int parse_mac(const char *text, uint8_t mac[6])
+{
+    unsigned int b[6];
+    int consumed = 0;
+
+    if (text == NULL || sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x%n",
+                               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5],
+                               &consumed) != 6 || text[consumed] != '\0')
+        return -EINVAL;
+    for (unsigned int i = 0; i < 6; i++)
+        mac[i] = b[i];
+    return 0;
+}
+
 static int serve(const char *pci_addr, const char *gemini_path,
-                 const char *control_path)
+                 const char *control_path, const uint8_t mac[6],
+                 const char *uar_ipc_path)
 {
     struct gemini_server gemini;
     struct pci_fe fe;
@@ -190,7 +206,7 @@ static int serve(const char *pci_addr, const char *gemini_path,
         fprintf(stderr, "failed to create Gemini server: %s\n", strerror(-rc));
         return 1;
     }
-    result = pci_fe_init(&fe, pci_addr, &gemini);
+    result = pci_fe_init(&fe, pci_addr, &gemini, mac, uar_ipc_path);
     if (result != DOCA_SUCCESS) {
         fprintf(stderr, "failed to initialize pci-fe: %s\n",
                 doca_error_get_descr(result));
@@ -231,12 +247,17 @@ int main(int argc, char **argv)
         {"pci-addr", required_argument, NULL, 'p'},
         {"gemini-socket", required_argument, NULL, 'g'},
         {"control-socket", required_argument, NULL, 'c'},
+        {"netdev-mac", required_argument, NULL, 'm'},
+        {"uar-ipc", required_argument, NULL, 'u'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     const char *pci_addr = VFIO_ADMINQ_DEFAULT_DOCA_PCI_ADDR;
     const char *gemini_path = SRDMA_GEMINI_DEFAULT_SOCKET;
     const char *control_path = DEFAULT_CONTROL_SOCKET;
+    const char *mac_text = NULL;
+    const char *uar_ipc_path = SRDMA_UAR_IPC_DEFAULT_PATH;
+    uint8_t mac[6];
     const char *command;
     int opt;
 
@@ -246,7 +267,7 @@ int main(int argc, char **argv)
     }
     command = argv[1];
     optind = 2;
-    while ((opt = getopt_long(argc, argv, "p:g:c:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:c:m:u:h", options, NULL)) != -1) {
         switch (opt) {
         case 'p':
             pci_addr = optarg;
@@ -256,6 +277,12 @@ int main(int argc, char **argv)
             break;
         case 'c':
             control_path = optarg;
+            break;
+        case 'm':
+            mac_text = optarg;
+            break;
+        case 'u':
+            uar_ipc_path = optarg;
             break;
         case 'h':
             usage(argv[0]);
@@ -277,10 +304,14 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
+    if (parse_mac(mac_text, mac) != 0) {
+        fprintf(stderr, "serve requires a valid --netdev-mac\n");
+        return 2;
+    }
 
     (void)doca_log_backend_create_standard();
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
-    return serve(pci_addr, gemini_path, control_path);
+    return serve(pci_addr, gemini_path, control_path, mac, uar_ipc_path);
 }
