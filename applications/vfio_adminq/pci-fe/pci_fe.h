@@ -6,6 +6,8 @@
 
 #include <doca_error.h>
 
+#include "../common/vfio_adminq_abi.h"
+
 #include "gemini_server.h"
 
 struct doca_ctx;
@@ -41,6 +43,8 @@ struct pci_fe {
     struct doca_devemu_pci_tlp_channel *tlp_channel;
     struct doca_ctx *channel_ctx;
     struct gemini_server *gemini;
+    struct vfio_adminq_srdma_config *shared_config;
+    struct vfio_adminq_shared_msix *shared_msix;
 
     enum pci_fe_state state;
     enum pci_fe_pending_action pending_action;
@@ -65,6 +69,7 @@ struct pci_fe {
     uint16_t bdf;
     uint8_t mac[6];
     uint64_t generation;
+    uint64_t tlp_sequence;
     uint32_t heartbeat;
     uint64_t heartbeat_last_ns;
 };

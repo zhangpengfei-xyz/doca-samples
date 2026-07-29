@@ -16,7 +16,7 @@
   AdminQ DPA doorbell completion 和 MSI-X。
 - `vfio_adminq_host_emu`：Host 侧 VFIO 测试程序，负责 AdminQ DMA/DB 闭环。
 
-v2 只支持一个 endpoint，提供 128-depth AdminQ、129 个 MSI-X vector 和
+v2 只支持一个 endpoint，提供 128-depth AdminQ、128 个 MSI-X vector 和
 UCTX/PD/MR/EQ/CQ/QP 控制面；不实现 RoCE 数据面。
 
 ## DPU 构建
@@ -163,9 +163,10 @@ rdma link show srdma_0/1
 ibv_devinfo -d srdma_0
 ```
 
-期望 `srdma_0/1 state ACTIVE`、`netdev eth0`。PCI 配置应只有一个 256 KiB BAR0，
-MSI-X table size 为 129；运行时只需按需创建实际使用的 vector object，control path
-使用 vector 0。
+期望 `srdma_0/1 state ACTIVE`、`netdev eth0`。PCI 配置应报告一个 64 KiB BAR0 和
+128-entry MSI-X capability；DOCA type 的 BAR0 aperture 为 1 MiB。MSI-X table/PBA
+位于 transaction region，由 `pci-fe` 软件处理；control path 的 vector 0 address/data
+同步给 `dev-be`，由后者直接 DMA 写 MSI-X address。
 
 ```bash
 lspci -Dvv -s "$SRDMA_BDF" | \

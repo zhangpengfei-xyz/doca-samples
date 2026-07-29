@@ -4,6 +4,7 @@
 #include "../common/vfio_adminq_abi.h"
 #include "doorbell_common.h"
 
+#include <endian.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,11 +32,13 @@
 DOCA_LOG_REGISTER(SRDMA_BACKEND);
 
 #define SRDMA_DPU_DMA_INVENTORY_SIZE 2
-#define SRDMA_MSIX_CAP_ID 0x11U
-#define SRDMA_MSIX_CAP_OFFSET 0x40U
-#define SRDMA_PCIE_CAP_ID 0x10U
-#define SRDMA_PCIE_CAP_OFFSET 0x50U
-#define SRDMA_PCIE_CAP_LENGTH 0x3cU
+#define SRDMA_MSIX_VEC0_CONFIG_SIZE 16U
+#define SRDMA_MSIX_ADDR_OFFSET 0U
+#define SRDMA_MSIX_DATA_OFFSET 8U
+#define SRDMA_MSIX_CONTROL_OFFSET 12U
+_Static_assert(sizeof(((struct vfio_adminq_srdma_config *)0)->msix_vec0) ==
+                   SRDMA_MSIX_VEC0_CONFIG_SIZE,
+               "unexpected MSI-X vector 0 config size");
 /* Host doorbells are consumed by the DPA thread and forwarded over Comch. */
 #define SRDMA_DPU_BAR_ID VFIO_ADMINQ_BAR0_ID
 #define SRDMA_DPU_BAR0_DB_OFFSET VFIO_ADMINQ_DB_REGION_OFFSET
@@ -81,7 +84,7 @@ struct srdma_backend_resources {
     uint16_t adminq_rx_pi;
     uint32_t adminq_host_seq;
     uint64_t generation;
-    struct doca_devemu_pci_msix *control_msix;
+    struct vfio_adminq_srdma_config *shared_config;
     struct srdma_admin admin;
     bool logger_ready;
     bool adminq_ready;
@@ -242,10 +245,6 @@ static doca_error_t configure_and_start_pci_type(
         return result;
     }
 
-    result = doca_devemu_pci_type_set_num_msix(pci_type,
-                                                VFIO_ADMINQ_NUM_MSIX);
-    if (result != DOCA_SUCCESS)
-        return result;
     result = doca_devemu_pci_type_set_num_db(pci_type,
                                               VFIO_ADMINQ_DB_COUNT);
     if (result != DOCA_SUCCESS)
@@ -253,7 +252,7 @@ static doca_error_t configure_and_start_pci_type(
 
     result = doca_devemu_pci_type_set_memory_bar_conf(
         pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE,
-        DOCA_DEVEMU_PCI_BAR_MEM_TYPE_64_BIT, 0);
+        DOCA_DEVEMU_PCI_BAR_MEM_TYPE_64_BIT, 1);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to configure BAR0", result);
         return result;
@@ -267,8 +266,8 @@ static doca_error_t configure_and_start_pci_type(
     }
 
     result = doca_devemu_pci_tlp_type_set_bar_transaction_region_conf(
-        pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_BAR0_CFG_OFFSET,
-        VFIO_ADMINQ_BAR0_CFG_SIZE);
+        pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
+        VFIO_ADMINQ_TLP_REGION_OFFSET, VFIO_ADMINQ_TLP_REGION_SIZE);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to configure BAR0 TLP region", result);
         return result;
@@ -278,26 +277,6 @@ static doca_error_t configure_and_start_pci_type(
         pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
         VFIO_ADMINQ_DB_REGION_OFFSET, VFIO_ADMINQ_DB_REGION_SIZE,
         VFIO_ADMINQ_DB_LOG_SIZE, VFIO_ADMINQ_DB_STRIDE_LOG_SIZE);
-    if (result != DOCA_SUCCESS)
-        return result;
-
-    result = doca_devemu_pci_type_set_bar_msix_table_region_conf(
-        pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET,
-        VFIO_ADMINQ_MSIX_TABLE_SIZE);
-    if (result != DOCA_SUCCESS)
-        return result;
-    result = doca_devemu_pci_type_set_bar_msix_pba_region_conf(
-        pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_PBA_OFFSET,
-        VFIO_ADMINQ_MSIX_PBA_SIZE);
-    if (result != DOCA_SUCCESS)
-        return result;
-    result = doca_devemu_pci_tlp_type_set_pci_cap_conf(
-        pci_type, SRDMA_MSIX_CAP_ID, SRDMA_MSIX_CAP_OFFSET, 12);
-    if (result != DOCA_SUCCESS)
-        return result;
-    result = doca_devemu_pci_tlp_type_set_pci_cap_conf(
-        pci_type, SRDMA_PCIE_CAP_ID, SRDMA_PCIE_CAP_OFFSET,
-        SRDMA_PCIE_CAP_LENGTH);
     if (result != DOCA_SUCCESS)
         return result;
 
@@ -374,12 +353,6 @@ static doca_error_t create_started_tlp_endpoint(uint16_t num_db)
         log_doca_error("failed to configure endpoint doorbell count", result);
         return result;
     }
-    result = doca_devemu_pci_ep_set_num_msix(ep, VFIO_ADMINQ_NUM_MSIX);
-    if (result != DOCA_SUCCESS) {
-        log_doca_error("failed to configure endpoint MSI-X count", result);
-        return result;
-    }
-
     result = doca_devemu_pci_tlp_dev_start(g_res.tlp_dev);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to start TLP endpoint", result);
@@ -652,6 +625,75 @@ out_dst:
 out_src:
     if (src_buf != NULL) {
         (void)doca_buf_dec_refcount(src_buf, NULL);
+    }
+    return result;
+}
+
+static bool srdma_backend_read_msix0(struct srdma_backend_resources *res,
+                                     uint64_t *address, uint32_t *data,
+                                     uint32_t *control)
+{
+    uint8_t first[SRDMA_MSIX_VEC0_CONFIG_SIZE];
+    uint8_t second[SRDMA_MSIX_VEC0_CONFIG_SIZE];
+
+    if (res->shared_config == NULL)
+        return false;
+
+    for (unsigned int attempt = 0; attempt < 100; attempt++) {
+        memcpy(first, &res->shared_config->msix_vec0, sizeof(first));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        memcpy(second, &res->shared_config->msix_vec0, sizeof(second));
+        if (memcmp(first, second, sizeof(first)) == 0) {
+            memcpy(address, first + SRDMA_MSIX_ADDR_OFFSET,
+                   sizeof(*address));
+            memcpy(data, first + SRDMA_MSIX_DATA_OFFSET, sizeof(*data));
+            memcpy(control, first + SRDMA_MSIX_CONTROL_OFFSET,
+                   sizeof(*control));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static doca_error_t srdma_msix_request(uint32_t vector)
+{
+    uint64_t address;
+    uint32_t data;
+    uint32_t control;
+    uint32_t message_data;
+    doca_error_t result;
+
+    if (vector != 0 || g_res.shared_config == NULL)
+        return DOCA_ERROR_INVALID_VALUE;
+    if (!srdma_backend_read_msix0(&g_res, &address, &data, &control)) {
+        DOCA_LOG_ERR("cannot read a stable MSI-X vector 0 configuration");
+        return DOCA_ERROR_BAD_STATE;
+    }
+    if (address == 0 || (address & UINT64_C(3)) != 0) {
+        DOCA_LOG_ERR("cannot DMA MSI-X vector 0 to invalid address 0x%" PRIx64,
+                     address);
+        return DOCA_ERROR_BAD_STATE;
+    }
+    if ((control & (VFIO_ADMINQ_MSIX_CTRL_MASK |
+                    VFIO_ADMINQ_MSIX_CTRL_DISABLE)) != 0) {
+        DOCA_LOG_WARN("cannot DMA MSI-X vector 0 while masked or disabled "
+                      "(control=0x%08x)", control);
+        return DOCA_ERROR_BAD_STATE;
+    }
+    if (g_res.local_dma_size < sizeof(message_data))
+        return DOCA_ERROR_INVALID_VALUE;
+
+    message_data = htole32(data);
+    memcpy(g_res.local_dma_buf, &message_data, sizeof(message_data));
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    result = srdma_dma_copy(g_res.local_mmap, g_res.local_dma_buf,
+                            g_res.remote_mmap,
+                            (void *)(uintptr_t)address,
+                            sizeof(message_data));
+    if (result == DOCA_SUCCESS) {
+        DOCA_LOG_DBG("DMA wrote MSI-X vector 0: address=0x%" PRIx64
+                     " data=0x%08x", address, data);
     }
     return result;
 }
@@ -1182,7 +1224,8 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
 
     if (opts == NULL || opts->pci_addr == NULL || opts->pci_type_name == NULL ||
         opts->local_dma_size < SRDMA_ADMIN_ENTRY_SIZE ||
-        opts->num_db != VFIO_ADMINQ_DB_COUNT) {
+        opts->num_db != VFIO_ADMINQ_DB_COUNT ||
+        opts->shared_config == NULL) {
         return DOCA_ERROR_INVALID_VALUE;
     }
 
@@ -1201,6 +1244,7 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
     g_res.adminq_tx_ci = 0;
     g_res.adminq_rx_pi = 0;
     g_res.generation = opts->generation;
+    g_res.shared_config = opts->shared_config;
     g_res.adminq_ready = false;
     g_res.initial_db_pending = 0;
     srdma_admin_init(&g_res.admin, (uint32_t)g_res.generation);
@@ -1244,15 +1288,6 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
     result = create_doorbells();
     if (result != DOCA_SUCCESS)
         goto fail;
-
-    result = doca_devemu_pci_ep_create_msix(
-        doca_devemu_pci_tlp_dev_as_ep(g_res.tlp_dev),
-        VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET, 0,
-        &g_res.control_msix);
-    if (result != DOCA_SUCCESS) {
-        log_doca_error("failed to create control MSI-X", result);
-        goto fail;
-    }
 
     DOCA_LOG_INFO("SRDMA backend initialized successfully for vhca_id=%u",
                   opts->vhca_id);
@@ -1372,7 +1407,9 @@ static doca_error_t process_adminq_pi(uint16_t producer)
         if (result != DOCA_SUCCESS)
             return result;
         g_res.adminq_rx_pi++;
-        doca_devemu_pci_msix_raise(g_res.control_msix);
+        result = srdma_msix_request(0);
+        if (result != DOCA_SUCCESS)
+            return result;
     }
     return DOCA_SUCCESS;
 }
@@ -1385,7 +1422,6 @@ doca_error_t srdma_backend_progress(void)
 
     while (doca_pe_progress(g_res.pe) != 0) {
     }
-
     return DOCA_SUCCESS;
 }
 
@@ -1400,12 +1436,7 @@ void srdma_backend_cleanup(void)
     g_res.adminq_tx_depth = 0;
     g_res.adminq_host_seq = 0;
 
-    if (g_res.control_msix != NULL) {
-        result = doca_devemu_pci_msix_destroy(g_res.control_msix);
-        if (result != DOCA_SUCCESS)
-            log_doca_error("failed to destroy control MSI-X", result);
-        g_res.control_msix = NULL;
-    }
+    g_res.shared_config = NULL;
     for (uint32_t db_id = SRDMA_DB_TYPE_COUNT; db_id-- > 0;) {
         if (g_res.db[db_id] == NULL)
             continue;

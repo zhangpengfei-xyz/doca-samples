@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
@@ -18,6 +19,11 @@ struct srdma_gemini_runtime {
     struct srdma_backend_opts opts;
     bool initialized;
     uint16_t vhca_id;
+    int shm_fd;
+    void *shm_addr;
+    size_t shm_size;
+    uint8_t *srdma_config;
+    size_t srdma_config_len;
 };
 
 static volatile sig_atomic_t srdma_gemini_stop;
@@ -159,14 +165,55 @@ static int srdma_gemini_send_msg(int fd, struct srdma_gemini_msg *msg)
     return write_full(fd, &msg->payload, len);
 }
 
-static int srdma_gemini_recv_msg(int fd, struct srdma_gemini_msg *msg)
+static int recv_header_with_fd(int fd, void *buf, size_t len,
+                               int *received_fd)
+{
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {.iov_base = buf, .iov_len = len};
+    struct msghdr msgh = {0};
+    struct cmsghdr *cmsg;
+    ssize_t ret;
+
+    memset(control, 0, sizeof(control));
+    msgh.msg_iov = &iov;
+    msgh.msg_iovlen = 1;
+    msgh.msg_control = control;
+    msgh.msg_controllen = sizeof(control);
+    do {
+        ret = recvmsg(fd, &msgh, 0);
+    } while (ret < 0 && errno == EINTR);
+    if (ret <= 0)
+        return ret == 0 ? 1 : -1;
+
+    if (received_fd != NULL) {
+        *received_fd = -1;
+        for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS &&
+                cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+                memcpy(received_fd, CMSG_DATA(cmsg), sizeof(int));
+                break;
+            }
+        }
+    }
+    if ((size_t)ret == len)
+        return 0;
+    return read_full(fd, (uint8_t *)buf + ret, len - (size_t)ret);
+}
+
+static int srdma_gemini_recv_msg_fd(int fd, struct srdma_gemini_msg *msg,
+                                    int *received_fd)
 {
     uint32_t len;
     int ret;
 
     memset(msg, 0, sizeof(*msg));
 
-    ret = read_full(fd, msg, SRDMA_GEMINI_MSG_HDR_SIZE);
+    if (received_fd != NULL)
+        *received_fd = -1;
+    ret = recv_header_with_fd(fd, msg, SRDMA_GEMINI_MSG_HDR_SIZE,
+                              received_fd);
     if (ret != 0) {
         return ret;
     }
@@ -181,6 +228,11 @@ static int srdma_gemini_recv_msg(int fd, struct srdma_gemini_msg *msg)
     }
 
     return read_full(fd, &msg->payload, len);
+}
+
+static int srdma_gemini_recv_msg(int fd, struct srdma_gemini_msg *msg)
+{
+    return srdma_gemini_recv_msg_fd(fd, msg, NULL);
 }
 
 static int srdma_gemini_send_reply(
@@ -250,6 +302,62 @@ static doca_error_t srdma_gemini_send_hello(int fd)
     return DOCA_SUCCESS;
 }
 
+static doca_error_t srdma_gemini_scan(int fd,
+                                      struct srdma_gemini_runtime *runtime)
+{
+    const struct srdma_gemini_scan_result *scan;
+    struct srdma_gemini_msg msg;
+    int shm_fd = -1;
+    int ret;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.request = GEMINI_SCAN;
+    msg.request_id = 2;
+    msg.flags = GEMINI_MSG_F_NEEDS_REPLY;
+    msg.data_len = 0;
+    if (srdma_gemini_send_msg(fd, &msg) != 0)
+        return DOCA_ERROR_IO_FAILED;
+    ret = srdma_gemini_recv_msg_fd(fd, &msg, &shm_fd);
+    if (ret != 0 || shm_fd < 0)
+        goto fail;
+    if ((msg.flags & GEMINI_MSG_F_IS_REPLY) == 0 ||
+        (msg.flags & GEMINI_MSG_F_HAS_ERROR) != 0 ||
+        msg.request != GEMINI_SCAN || msg.request_id != 2 ||
+        msg.data_len != sizeof(msg.payload.scan))
+        goto fail;
+
+    scan = &msg.payload.scan;
+    if (scan->shm_size == 0 || scan->shm_size > SIZE_MAX ||
+        scan->srdma_config.offset > scan->shm_size ||
+        scan->srdma_config.length >
+            scan->shm_size - scan->srdma_config.offset ||
+        scan->srdma_config.length <
+            sizeof(struct vfio_adminq_srdma_config))
+        goto fail;
+    runtime->shm_addr = mmap(NULL, scan->shm_size, PROT_READ,
+                             MAP_SHARED, shm_fd, 0);
+    if (runtime->shm_addr == MAP_FAILED) {
+        runtime->shm_addr = NULL;
+        goto fail;
+    }
+    runtime->shm_fd = shm_fd;
+    runtime->shm_size = scan->shm_size;
+    runtime->srdma_config =
+        ((uint8_t *)runtime->shm_addr + scan->srdma_config.offset);
+    runtime->srdma_config_len = scan->srdma_config.length;
+    printf("srdma Gemini SCAN mapped: size=0x%zx config=0x%" PRIx64
+           "/0x%zx db=0x%" PRIx64 "\n",
+           runtime->shm_size, scan->srdma_config.offset,
+           runtime->srdma_config_len, scan->srdma_config.db_offset);
+    return DOCA_SUCCESS;
+
+fail:
+    if (shm_fd >= 0)
+        close(shm_fd);
+    runtime->shm_fd = -1;
+    return DOCA_ERROR_BAD_STATE;
+}
+
 static uint8_t srdma_gemini_handle_plug(
     struct srdma_gemini_runtime *runtime,
     const struct srdma_gemini_msg *msg)
@@ -282,6 +390,17 @@ static uint8_t srdma_gemini_handle_plug(
     opts = runtime->opts;
     opts.vhca_id = vhca_id;
     opts.generation = plug->rsvd1[0];
+    if ((size_t)plug->rvf_id >
+        (runtime->srdma_config_len -
+         sizeof(struct vfio_adminq_srdma_config)) /
+            sizeof(struct vfio_adminq_srdma_config)) {
+        fprintf(stderr, "SRDMA rvf_id=%u is outside shared config len=%zu\n",
+                plug->rvf_id, runtime->srdma_config_len);
+        return GEMINI_MSG_ERR_INVALID_PAYLOAD;
+    }
+    opts.shared_config = (struct vfio_adminq_srdma_config *)
+        (runtime->srdma_config +
+         (size_t)plug->rvf_id * sizeof(struct vfio_adminq_srdma_config));
 
     result = srdma_backend_init(&opts);
     if (result != DOCA_SUCCESS) {
@@ -428,6 +547,7 @@ doca_error_t srdma_gemini_serve(
 
     memset(&runtime, 0, sizeof(runtime));
     runtime.opts = *base_opts;
+    runtime.shm_fd = -1;
     srdma_gemini_stop = 0;
     srdma_gemini_install_signals();
 
@@ -437,6 +557,11 @@ doca_error_t srdma_gemini_serve(
     }
 
     result = srdma_gemini_send_hello(fd);
+    if (result != DOCA_SUCCESS) {
+        close(fd);
+        return result;
+    }
+    result = srdma_gemini_scan(fd, &runtime);
     if (result != DOCA_SUCCESS) {
         close(fd);
         return result;
@@ -516,6 +641,10 @@ out:
     if (runtime.initialized) {
         srdma_backend_cleanup();
     }
+    if (runtime.shm_addr != NULL)
+        munmap(runtime.shm_addr, runtime.shm_size);
+    if (runtime.shm_fd >= 0)
+        close(runtime.shm_fd);
     close(fd);
     return result;
 }

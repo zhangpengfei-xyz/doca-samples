@@ -21,6 +21,7 @@ struct srdma_backend_opts {
     size_t local_dma_size;
     uint32_t timeout_sec;
     uint64_t generation;
+    struct vfio_adminq_srdma_config *shared_config;
 };
 
 void srdma_backend_default_opts(struct srdma_backend_opts *opts);

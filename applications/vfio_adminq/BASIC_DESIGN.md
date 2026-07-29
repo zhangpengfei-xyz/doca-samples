@@ -612,7 +612,10 @@ Host 在 BUSY 时 reset。
 - DOCA type BAR0 为 1 MiB，而 Host-visible BAR0 为 64 KiB；v1 不改变。
 - PLUG/START payload 带有大量 SRDMA/netdev/MSI-X 保留字段，本项目仍需按原大小传输。
 - `srdma_adminq_test_msg` 只是一次一命令的验证结构，不是通用生产 AdminQ。
-- 无 MSI-X 时 Host 只能轮询；这是 v1 明确边界，不通过新增 BAR 状态或新消息补偿。
+- MSI-X table/PBA 由 transaction region 中的软件模型提供；`pci-fe` 将 vector 0 的
+  address/data/control 同步到 SCAN config，`dev-be` 通过 endpoint remote mmap 直接
+  DMA 写 MSI-X address。SCAN 的 `msix_offset/msix_length` 与 io-engine 一样保持为
+  0；PBA 保留为 Host 可见只读 ABI，不作为后端通知通道或 Gemini 后端 ABI。
 
 上述问题只能在后续明确升级 ABI 时统一解决，不允许在 v1 实现过程中静默修改。
 
@@ -621,12 +624,12 @@ Host 在 BUSY 时 reset。
 | 新模块 | 主要来源 | v1 处理 |
 | --- | --- | --- |
 | `pci-fe/pci_type.c` | io-engine `hw/bes2/bf3/bf3_dev.c` | 保留 custom type、BAR region、rep、frontend TLP endpoint；删除 vnet/vblk、pool 和 live upgrade |
-| `pci-fe/tlp_channel.c` | io-engine `hw/bes2/bf3/tlp.c` | 保留 primary channel、PE、callback、completion；删除 LU、ACG 优化和多 Host |
+| `pci-fe/tlp_channel.c` | io-engine `hw/bes2/bf3/tlp.c` | 保留 primary channel、PE、callback 和 Host TLP completion；不启用 ACG，删除 LU 和多 Host |
 | `pci-fe/tlp_dispatch.c` | io-engine `hw/bes2/bes2_tlp_handler.c` | 只保留单 topology 的 Cfg/Mem 请求、byte enable 和 completion |
 | `pci-fe/pci_config.c` | io-engine PCI/QEMU config 行为及 `applications/vnet_pci_dev/pci_spec_tlp.*` | 用独立 256 字节模型代替 QEMU object model |
-| `pci-fe/bar0.c` | io-engine `hw/bes2/srdma_bfa.c/.h` | 保留寄存器、START/STOP 触发；删除 SR-IOV、MSI-X、迁移和 netdev peer |
+| `pci-fe/bar0.c` | io-engine `hw/bes2/srdma_bfa.c/.h` | 保留寄存器、START/STOP 触发及软件 MSI-X table/PBA；删除 SR-IOV、迁移和 netdev peer |
 | `pci-fe/gemini_server.c` | io-engine `hw/bes2/server.c`、`client.c`、`message.h` | 只实现单 SRDMA client、HELLO、四种 CONFIG_UPDATE 和 reply timeout |
 | `dev-be/gemini_client.c` | 已验证 demo `host/gemini_client.c` | 原样保持 framing、payload 和状态语义 |
-| `dev-be/backend.c` | 已验证 demo `host/srdma_backend.c` 及 DPA doorbell 文件 | 保留 PLUG attach、DB/DPA/DMA；删除未使用扩展 |
+| `dev-be/backend.c` | 已验证 demo `host/srdma_backend.c` 及 DPA doorbell 文件 | 保留 PLUG attach、DB/DPA/DMA 和直接 MSI-X address DMA；删除未使用扩展 |
 | `host-emu/host_emu.c` | 已验证 demo `instance/srdma-driver.c` | 保留 VFIO、BAR、DMA、DB 和轮询；重命名 SRDMA 日志但不改 ABI |
 | `common/vfio_adminq_abi.h` | demo `common/srdma_adminq_test.h` 与 io-engine `message.h`/`srdma_bfa.h` | 集中定义并添加结构大小断言，不改变字段 |
