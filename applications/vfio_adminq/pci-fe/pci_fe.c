@@ -41,8 +41,14 @@ DOCA_LOG_REGISTER(VFIO_ADMINQ_PCI_FE);
 #define PCI_MSIX_MSGCTRL_ENABLE (1U << 31)
 #define PCI_MSIX_MSGCTRL_MASKALL (1U << 30)
 #define PCI_BAR0_FLAGS 0x4U
-#define PCI_BAR0_LOW_MASK 0xfffc0000U
+#define PCI_BAR0_LOW_MASK 0xffff0000U
 #define PCI_CONFIG_DWORDS (sizeof(((struct pci_fe *)0)->config_space) / 4U)
+
+/* The MSI-X table/PBA are software-owned transaction-region data. */
+#define VFIO_ADMINQ_EXPOSED_MSIX 32U
+
+_Static_assert(VFIO_ADMINQ_EXPOSED_MSIX <= VFIO_ADMINQ_NUM_MSIX,
+               "Host-visible MSI-X count exceeds backing table storage");
 
 #define SRDMA_HEALTH_MAC0_ALIVE (1U << 0)
 #define SRDMA_HEALTH_MAC1_ALIVE (1U << 1)
@@ -82,6 +88,26 @@ enum pci_fe_tlp_kind {
     PCI_FE_TLP_CFGRD1,
     PCI_FE_TLP_CFGWR1,
 };
+
+static const char *tlp_kind_name(enum pci_fe_tlp_kind kind)
+{
+    switch (kind) {
+    case PCI_FE_TLP_MRD:
+        return "MRd";
+    case PCI_FE_TLP_MWR:
+        return "MWr";
+    case PCI_FE_TLP_CFGRD0:
+        return "CfgRd0";
+    case PCI_FE_TLP_CFGWR0:
+        return "CfgWr0";
+    case PCI_FE_TLP_CFGRD1:
+        return "CfgRd1";
+    case PCI_FE_TLP_CFGWR1:
+        return "CfgWr1";
+    default:
+        return "invalid";
+    }
+}
 
 static uint32_t byte_enable_mask(uint8_t be)
 {
@@ -159,7 +185,7 @@ static void init_config_space(struct pci_fe *fe)
     store_config_dword(fe, PCI_SUBSYSTEM_OFFSET / 4U, value);
     store_config_dword(fe, PCI_CAP_PTR_OFFSET / 4U, PCI_MSIX_CAP_OFFSET);
     value = PCI_MSIX_CAP_ID | (PCI_EXP_CAP_OFFSET << 8) |
-            ((VFIO_ADMINQ_NUM_MSIX - 1U) << 16);
+            ((VFIO_ADMINQ_EXPOSED_MSIX - 1U) << 16);
     store_config_dword(fe, PCI_MSIX_CAP_OFFSET / 4U, value);
     store_config_dword(fe, PCI_MSIX_CAP_OFFSET / 4U + 1U,
                        VFIO_ADMINQ_MSIX_TABLE_OFFSET | VFIO_ADMINQ_BAR0_ID);
@@ -188,7 +214,57 @@ static void reset_bar_state(struct pci_fe *fe)
     fe->pending_action = PCI_FE_ACTION_NONE;
 }
 
-static uint32_t bar0_read32(const struct pci_fe *fe, uint32_t offset)
+static void reset_msix_state(struct pci_fe *fe)
+{
+    struct vfio_adminq_srdma_config *config = fe->shared_config;
+    struct vfio_adminq_shared_msix *msix = fe->shared_msix;
+
+    if (config == NULL || msix == NULL)
+        return;
+    memset(msix, 0, sizeof(*msix));
+    for (uint32_t i = 0; i < VFIO_ADMINQ_NUM_MSIX; i++)
+        msix->table[i].vector_ctrl = VFIO_ADMINQ_MSIX_ENTRY_MASKED;
+    for (uint32_t i = 0; i < VFIO_ADMINQ_NUM_MSIX / 64U; i++)
+        __atomic_store_n(&msix->pba[i], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&config->msix_vec0.msix_addr, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&config->msix_vec0.msix_data, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&config->msix_vec0.control,
+                     VFIO_ADMINQ_MSIX_CTRL_MASK |
+                         VFIO_ADMINQ_MSIX_CTRL_DISABLE,
+                     __ATOMIC_RELEASE);
+}
+
+static void sync_msix_vector0(struct pci_fe *fe)
+{
+    struct vfio_adminq_srdma_config *config = fe->shared_config;
+    struct vfio_adminq_shared_msix *msix = fe->shared_msix;
+    const struct vfio_adminq_msix_entry *entry;
+    uint32_t msgctrl;
+    uint32_t control = 0;
+    uint64_t address;
+
+    if (config == NULL || msix == NULL)
+        return;
+    entry = &msix->table[0];
+    msgctrl = load_config_dword(fe, PCI_MSIX_CAP_OFFSET / 4U);
+    if ((__atomic_load_n(&entry->vector_ctrl, __ATOMIC_RELAXED) &
+         VFIO_ADMINQ_MSIX_ENTRY_MASKED) != 0)
+        control |= VFIO_ADMINQ_MSIX_CTRL_MASK;
+    if ((msgctrl & PCI_MSIX_MSGCTRL_ENABLE) == 0 ||
+        (msgctrl & PCI_MSIX_MSGCTRL_MASKALL) != 0)
+        control |= VFIO_ADMINQ_MSIX_CTRL_DISABLE;
+    address = (uint64_t)__atomic_load_n(&entry->addr_lo, __ATOMIC_RELAXED) |
+              ((uint64_t)__atomic_load_n(&entry->addr_hi, __ATOMIC_RELAXED)
+               << 32);
+    __atomic_store_n(&config->msix_vec0.msix_addr, address,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&config->msix_vec0.msix_data,
+                     __atomic_load_n(&entry->data, __ATOMIC_RELAXED),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&config->msix_vec0.control, control, __ATOMIC_RELEASE);
+}
+
+static uint32_t bar0_config_read32(const struct pci_fe *fe, uint32_t offset)
 {
     uint32_t value = 0;
 
@@ -200,7 +276,7 @@ static uint32_t bar0_read32(const struct pci_fe *fe, uint32_t offset)
     case SRDMA_BFA_MAX_QP_NUM:
         return 128;
     case SRDMA_BFA_PCI_MAX_VECTORS:
-        return VFIO_ADMINQ_NUM_MSIX;
+        return VFIO_ADMINQ_EXPOSED_MSIX;
     case SRDMA_BFA_PCI_DEV_MACADDR:
         return (uint32_t)fe->mac[5] | ((uint32_t)fe->mac[4] << 8) |
                ((uint32_t)fe->mac[3] << 16) | ((uint32_t)fe->mac[2] << 24);
@@ -258,10 +334,10 @@ static void request_stop(struct pci_fe *fe)
         fe->pending_action = PCI_FE_ACTION_STOP;
 }
 
-static void bar0_write32(struct pci_fe *fe, uint32_t offset,
-                         uint32_t value, uint32_t mask)
+static void bar0_config_write32(struct pci_fe *fe, uint32_t offset,
+                                uint32_t value, uint32_t mask)
 {
-    uint32_t old = bar0_read32(fe, offset);
+    uint32_t old = bar0_config_read32(fe, offset);
     uint32_t merged = (old & ~mask) | (value & mask);
 
     switch (offset) {
@@ -299,6 +375,59 @@ static void bar0_write32(struct pci_fe *fe, uint32_t offset,
     default:
         break;
     }
+}
+
+static uint32_t bar0_read32(const struct pci_fe *fe, uint32_t offset)
+{
+    const struct vfio_adminq_shared_msix *msix = fe->shared_msix;
+
+    if (offset < VFIO_ADMINQ_BAR0_CFG_SIZE)
+        return bar0_config_read32(fe, offset);
+    if (msix == NULL)
+        return 0;
+    if (offset >= VFIO_ADMINQ_MSIX_TABLE_OFFSET &&
+        offset < VFIO_ADMINQ_MSIX_TABLE_OFFSET +
+                     VFIO_ADMINQ_MSIX_TABLE_SIZE) {
+        uint32_t relative = offset - VFIO_ADMINQ_MSIX_TABLE_OFFSET;
+        const uint32_t *word = (const uint32_t *)msix->table + relative / 4U;
+
+        return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+    }
+    if (offset >= VFIO_ADMINQ_MSIX_PBA_OFFSET &&
+        offset < VFIO_ADMINQ_MSIX_PBA_OFFSET + VFIO_ADMINQ_MSIX_PBA_SIZE) {
+        uint32_t relative = offset - VFIO_ADMINQ_MSIX_PBA_OFFSET;
+        uint64_t bits = __atomic_load_n(&msix->pba[relative / 8U],
+                                        __ATOMIC_ACQUIRE);
+
+        return (uint32_t)(bits >> ((relative & 4U) * 8U));
+    }
+    return 0;
+}
+
+static void bar0_write32(struct pci_fe *fe, uint32_t offset,
+                         uint32_t value, uint32_t mask)
+{
+    struct vfio_adminq_shared_msix *msix = fe->shared_msix;
+
+    if (offset < VFIO_ADMINQ_BAR0_CFG_SIZE) {
+        bar0_config_write32(fe, offset, value, mask);
+        return;
+    }
+    if (msix != NULL && offset >= VFIO_ADMINQ_MSIX_TABLE_OFFSET &&
+        offset < VFIO_ADMINQ_MSIX_TABLE_OFFSET +
+                     VFIO_ADMINQ_MSIX_TABLE_SIZE) {
+        uint32_t relative = offset - VFIO_ADMINQ_MSIX_TABLE_OFFSET;
+        uint32_t *word = (uint32_t *)msix->table + relative / 4U;
+        uint32_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
+        uint32_t merged = (old & ~mask) | (value & mask);
+
+        if ((relative & (VFIO_ADMINQ_MSIX_ENTRY_SIZE - 1U)) == 12U)
+            merged &= VFIO_ADMINQ_MSIX_ENTRY_MASKED;
+        __atomic_store_n(word, merged, __ATOMIC_RELEASE);
+        if (relative < VFIO_ADMINQ_MSIX_ENTRY_SIZE)
+            sync_msix_vector0(fe);
+    }
+    /* The MSI-X PBA and transaction-region holes are read-only. */
 }
 
 static void handle_config_write(struct pci_fe *fe, uint32_t reg,
@@ -345,6 +474,7 @@ static void handle_config_write(struct pci_fe *fe, uint32_t reg,
     case PCI_MSIX_CAP_OFFSET: {
         uint32_t writable = PCI_MSIX_MSGCTRL_ENABLE | PCI_MSIX_MSGCTRL_MASKALL;
         store_config_dword(fe, reg, (old & ~writable) | (merged & writable));
+        sync_msix_vector0(fe);
         break;
     }
     case PCI_EXP_DEVCTL_OFFSET: {
@@ -432,33 +562,11 @@ static bool config_target_valid(struct pci_fe *fe, const void *header)
     return true;
 }
 
-static bool config_capability(uint32_t reg, uint16_t *cap_id,
-                              uint8_t *is_pcie_cap)
-{
-    uint32_t offset = reg * 4U;
-
-    *is_pcie_cap = 0;
-    if (offset >= PCI_MSIX_CAP_OFFSET &&
-        offset < PCI_MSIX_CAP_OFFSET + 12U) {
-        *cap_id = PCI_MSIX_CAP_ID;
-        return true;
-    }
-    if (offset >= PCI_EXP_CAP_OFFSET &&
-        offset < PCI_EXP_CAP_OFFSET + PCI_EXP_CAP_LENGTH) {
-        *cap_id = PCI_EXP_CAP_ID;
-        return true;
-    }
-    return false;
-}
-
 static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
                               struct pci_fe *fe, const void *header,
                               enum pci_fe_tlp_kind kind)
 {
     uint32_t reg = GET_TLP_EXT_REG(header);
-    uint16_t cap_id = 0;
-    uint8_t is_pcie_cap = 0;
-    uint8_t is_cap_id_valid;
 
     if (!config_target_valid(fe, header) ||
         (kind != PCI_FE_TLP_CFGRD0 && kind != PCI_FE_TLP_CFGWR0)) {
@@ -466,7 +574,6 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
         return;
     }
 
-    is_cap_id_valid = config_capability(reg, &cap_id, &is_pcie_cap);
     if (kind == PCI_FE_TLP_CFGRD0) {
         uint32_t value = load_config_dword(fe, reg);
         void *data = doca_devemu_pci_tlp_channel_req_get_tlp_cpl_data(req);
@@ -480,11 +587,15 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
          */
         set_completion_header(req, fe, header, 2, 1, TLP_CPL_STATUS_SC,
                               4, 0);
+        /*
+         * The complete PCI configuration space, including MSI-X and PCIe
+         * capabilities, is software-owned.  Do not provide a capability hint:
+         * DOCA must only transport the completion, not apply native capability
+         * side effects.
+         */
         doca_devemu_pci_tlp_channel_req_complete_config_read(req,
                                                               fe->tlp_dev,
-                                                              is_cap_id_valid,
-                                                              cap_id,
-                                                              is_pcie_cap);
+                                                              0, 0, 0);
     } else {
         const uint32_t *data = doca_devemu_pci_tlp_channel_req_get_tlp_data(req);
 
@@ -496,9 +607,7 @@ static void handle_config_tlp(struct doca_devemu_pci_tlp_channel_req *req,
         set_completion_header(req, fe, header, 0, 0, TLP_CPL_STATUS_SC, 4, 0);
         doca_devemu_pci_tlp_channel_req_complete_config_write(req,
                                                                fe->tlp_dev,
-                                                               is_cap_id_valid,
-                                                               cap_id,
-                                                               is_pcie_cap);
+                                                               0, 0, 0);
     }
 }
 
@@ -547,7 +656,7 @@ static void handle_memory_read(struct doca_devemu_pci_tlp_channel_req *req,
     data = doca_devemu_pci_tlp_channel_req_get_tlp_cpl_data(req);
     for (uint32_t i = 0; i < length; i++) {
         data[i] = bar == PCI_FE_MEMORY_BAR0 &&
-                          offset + i * 4U < VFIO_ADMINQ_BAR0_CFG_SIZE ?
+                          offset + i * 4U < VFIO_ADMINQ_TLP_REGION_SIZE ?
                       bar0_read32(fe, (offset + i * 4U) & ~3U) : 0;
         if (length == 1)
             byte_count += enabled_bytes(first_be);
@@ -594,7 +703,7 @@ static void handle_memory_write(struct doca_devemu_pci_tlp_channel_req *req,
             be = last_be;
         if (be == 0)
             be = 0xfU;
-        if (offset + i * 4U < VFIO_ADMINQ_BAR0_CFG_SIZE) {
+        if (offset + i * 4U < VFIO_ADMINQ_TLP_REGION_SIZE) {
             bar0_write32(fe, (offset + i * 4U) & ~3U,
                          data[i], byte_enable_mask(be));
         }
@@ -606,13 +715,38 @@ static void handle_tlp_request(struct doca_devemu_pci_tlp_channel_req *req,
                                struct pci_fe *fe)
 {
     const void *header = doca_devemu_pci_tlp_channel_req_get_tlp_header(req);
+    const uint32_t *data;
     enum pci_fe_tlp_kind kind;
+    uint64_t sequence;
 
     if (header == NULL || fe->tlp_dev == NULL) {
         doca_devemu_pci_tlp_channel_req_complete_tlp(req, 0, NULL);
         return;
     }
     kind = get_tlp_kind(header);
+    sequence = ++fe->tlp_sequence;
+    data = doca_devemu_pci_tlp_channel_req_get_tlp_data(req);
+    if (kind == PCI_FE_TLP_CFGRD0 || kind == PCI_FE_TLP_CFGWR0 ||
+        kind == PCI_FE_TLP_CFGRD1 || kind == PCI_FE_TLP_CFGWR1) {
+        DOCA_LOG_INFO("TLP #%" PRIu64 " %s bdf=%02x:%02x.%x reg=0x%03x "
+                      "len=%u first_be=0x%x last_be=0x%x data0=0x%08x",
+                      sequence, tlp_kind_name(kind), GET_TLP_BUS(header),
+                      GET_TLP_DEVICE(header), GET_TLP_FUNCTION(header),
+                      GET_TLP_EXT_REG(header) * 4U, GET_TLP_LENGTH(header),
+                      GET_TLP_FIRST_BE(header), GET_TLP_LAST_BE(header),
+                      data != NULL ? data[0] : 0);
+    } else if (kind == PCI_FE_TLP_MRD || kind == PCI_FE_TLP_MWR) {
+        DOCA_LOG_INFO("TLP #%" PRIu64 " %s addr=0x%" PRIx64
+                      " len=%u first_be=0x%x last_be=0x%x data0=0x%08x",
+                      sequence, tlp_kind_name(kind), tlp_memory_address(header),
+                      GET_TLP_LENGTH(header), GET_TLP_FIRST_BE(header),
+                      GET_TLP_LAST_BE(header), data != NULL ? data[0] : 0);
+    } else {
+        DOCA_LOG_WARN("TLP #%" PRIu64 " unsupported fmt=0x%x type=0x%x "
+                      "len=%u",
+                      sequence, GET_TLP_FMT(header), GET_TLP_TYPE(header),
+                      GET_TLP_LENGTH(header));
+    }
     switch (kind) {
     case PCI_FE_TLP_CFGRD0:
     case PCI_FE_TLP_CFGWR0:
@@ -644,10 +778,19 @@ static void handle_pci_event(struct doca_devemu_pci_tlp_channel_req *req,
 
         init_config_space(fe);
         reset_bar_state(fe);
+        reset_msix_state(fe);
         if (needs_stop)
             fe->pending_action = PCI_FE_ACTION_STOP;
     }
     doca_devemu_pci_tlp_channel_req_complete_pci_event(req);
+}
+
+static void tlp_fatal_state_cb(struct doca_devemu_pci_tlp_channel *channel,
+                               union doca_data user_data)
+{
+    (void)channel;
+    (void)user_data;
+    DOCA_LOG_ERR("TLP channel entered fatal state");
 }
 
 static void tlp_request_cb(struct doca_devemu_pci_tlp_channel *channel,
@@ -701,6 +844,7 @@ static doca_error_t find_tlp_device(const char *pci_addr,
 
 static doca_error_t init_pci_type(struct pci_fe *fe)
 {
+    uint16_t configured_msix = 0;
     doca_error_t result;
 
     result = doca_devemu_pci_tlp_type_create(VFIO_ADMINQ_PCI_TYPE_NAME,
@@ -710,12 +854,13 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
     result = doca_devemu_pci_type_set_dev(fe->pci_type, fe->dev);
     if (result != DOCA_SUCCESS)
         return result;
-    result = doca_devemu_pci_type_set_num_msix(fe->pci_type,
-                                                VFIO_ADMINQ_NUM_MSIX);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("set_num_msix failed: %s", doca_error_get_descr(result));
+    result = doca_devemu_pci_type_get_num_msix(fe->pci_type,
+                                                &configured_msix);
+    if (result != DOCA_SUCCESS)
         return result;
-    }
+    DOCA_LOG_INFO("software MSI-X model: DOCA type num_msix=%u, "
+                  "Host-visible vectors=%u", configured_msix,
+                  VFIO_ADMINQ_EXPOSED_MSIX);
     result = doca_devemu_pci_type_set_num_db(fe->pci_type,
                                               VFIO_ADMINQ_DB_COUNT);
     if (result != DOCA_SUCCESS) {
@@ -724,7 +869,7 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
     }
     result = doca_devemu_pci_type_set_memory_bar_conf(
         fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE,
-        DOCA_DEVEMU_PCI_BAR_MEM_TYPE_64_BIT, 0);
+        DOCA_DEVEMU_PCI_BAR_MEM_TYPE_64_BIT, 1);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("BAR0 config failed: %s", doca_error_get_descr(result));
         return result;
@@ -736,8 +881,8 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
         return result;
     }
     result = doca_devemu_pci_tlp_type_set_bar_transaction_region_conf(
-        fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_BAR0_CFG_OFFSET,
-        VFIO_ADMINQ_BAR0_CFG_SIZE);
+        fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID,
+        VFIO_ADMINQ_TLP_REGION_OFFSET, VFIO_ADMINQ_TLP_REGION_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("BAR0 transaction region failed: %s", doca_error_get_descr(result));
         return result;
@@ -748,34 +893,6 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
         VFIO_ADMINQ_DB_LOG_SIZE, VFIO_ADMINQ_DB_STRIDE_LOG_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("UAR doorbell region failed: %s",
-                     doca_error_get_descr(result));
-        return result;
-    }
-    result = doca_devemu_pci_type_set_bar_msix_table_region_conf(
-        fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_TABLE_OFFSET,
-        VFIO_ADMINQ_MSIX_TABLE_SIZE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("MSI-X table region failed: %s", doca_error_get_descr(result));
-        return result;
-    }
-    result = doca_devemu_pci_type_set_bar_msix_pba_region_conf(
-        fe->pci_type, VFIO_ADMINQ_DOCA_BAR0_ID, VFIO_ADMINQ_MSIX_PBA_OFFSET,
-        VFIO_ADMINQ_MSIX_PBA_SIZE);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("MSI-X PBA region failed: %s", doca_error_get_descr(result));
-        return result;
-    }
-    result = doca_devemu_pci_tlp_type_set_pci_cap_conf(
-        fe->pci_type, PCI_MSIX_CAP_ID, PCI_MSIX_CAP_OFFSET, 12);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("MSI-X capability config failed: %s", doca_error_get_descr(result));
-        return result;
-    }
-    result = doca_devemu_pci_tlp_type_set_pci_cap_conf(
-        fe->pci_type, PCI_EXP_CAP_ID, PCI_EXP_CAP_OFFSET,
-        PCI_EXP_CAP_LENGTH);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("PCI Express capability config failed: %s",
                      doca_error_get_descr(result));
         return result;
     }
@@ -834,6 +951,10 @@ static doca_error_t init_tlp_channel(struct pci_fe *fe)
                                                             tlp_request_cb);
     if (result != DOCA_SUCCESS)
         return result;
+    result = doca_devemu_pci_tlp_channel_event_fatal_state_register(
+        fe->tlp_channel, tlp_fatal_state_cb, user_data);
+    if (result != DOCA_SUCCESS)
+        return result;
     fe->channel_ctx = doca_devemu_pci_tlp_channel_as_ctx(fe->tlp_channel);
     result = doca_pe_connect_ctx(fe->pe, fe->channel_ctx);
     if (result != DOCA_SUCCESS)
@@ -881,6 +1002,7 @@ static void destroy_endpoint(struct pci_fe *fe)
     fe->vhca_id = 0;
     init_config_space(fe);
     reset_bar_state(fe);
+    reset_msix_state(fe);
 }
 
 static doca_error_t create_endpoint(struct pci_fe *fe)
@@ -898,9 +1020,6 @@ static doca_error_t create_endpoint(struct pci_fe *fe)
         return result;
     ep = doca_devemu_pci_tlp_dev_as_ep(fe->tlp_dev);
     result = doca_devemu_pci_ep_set_num_db(ep, VFIO_ADMINQ_DB_COUNT);
-    if (result != DOCA_SUCCESS)
-        return result;
-    result = doca_devemu_pci_ep_set_num_msix(ep, VFIO_ADMINQ_NUM_MSIX);
     if (result != DOCA_SUCCESS)
         return result;
     result = doca_devemu_pci_tlp_dev_start(fe->tlp_dev);
@@ -922,10 +1041,19 @@ doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
         return DOCA_ERROR_INVALID_VALUE;
     memset(fe, 0, sizeof(*fe));
     fe->gemini = gemini;
+    void *shared_base = gemini_server_shared_state(gemini);
+
+    if (shared_base == NULL)
+        return DOCA_ERROR_BAD_STATE;
+    fe->shared_config = (struct vfio_adminq_srdma_config *)
+        ((uint8_t *)shared_base + VFIO_ADMINQ_SHM_CONFIG_OFFSET);
+    fe->shared_msix = (struct vfio_adminq_shared_msix *)
+        ((uint8_t *)shared_base + VFIO_ADMINQ_SHM_MSIX_OFFSET);
     fe->state = PCI_FE_ABSENT;
     memcpy(fe->mac, mac, sizeof(fe->mac));
     init_config_space(fe);
     reset_bar_state(fe);
+    reset_msix_state(fe);
 
     result = find_tlp_device(pci_addr, &fe->dev);
     if (result != DOCA_SUCCESS)

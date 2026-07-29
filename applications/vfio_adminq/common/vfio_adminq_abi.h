@@ -12,22 +12,22 @@
 #define VFIO_ADMINQ_PCI_TYPE_NAME "custom_pci_dev"
 #define VFIO_ADMINQ_DEFAULT_DOCA_PCI_ADDR "0000:03:00.0"
 
-/* srdma.ko v2 single-BAR layout. */
+/* io-engine compatible single-BAR layout. */
 #define VFIO_ADMINQ_BAR0_ID 0U
 #define VFIO_ADMINQ_DOCA_BAR0_ID 0U
 #define VFIO_ADMINQ_BAR_ID VFIO_ADMINQ_BAR0_ID
-#define VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE 18U
-#define VFIO_ADMINQ_HOST_BAR0_SIZE 0x40000U
+#define VFIO_ADMINQ_DOCA_BAR0_LOG_SIZE 20U
+#define VFIO_ADMINQ_HOST_BAR0_SIZE 0x10000U
 #define VFIO_ADMINQ_BAR0_CFG_OFFSET 0x0000U
 #define VFIO_ADMINQ_BAR0_CFG_SIZE 0x1000U
 #define VFIO_ADMINQ_MSIX_TABLE_OFFSET 0x1000U
-#define VFIO_ADMINQ_MSIX_TABLE_SIZE 0x1000U
-#define VFIO_ADMINQ_MSIX_PBA_OFFSET 0x2000U
-#define VFIO_ADMINQ_MSIX_PBA_SIZE 0x1000U
+#define VFIO_ADMINQ_MSIX_TABLE_SIZE 0x0800U
+#define VFIO_ADMINQ_MSIX_PBA_OFFSET 0x1800U
+#define VFIO_ADMINQ_MSIX_PBA_SIZE 0x0010U
 #define VFIO_ADMINQ_UAR_BASE_OFFSET 0x8000U
 #define VFIO_ADMINQ_UAR_PAGE_SIZE 0x1000U
 #define VFIO_ADMINQ_UAR_MAX_ID 15U
-#define VFIO_ADMINQ_NUM_MSIX 129U
+#define VFIO_ADMINQ_NUM_MSIX 128U
 
 /*
  * All supported UAR contexts alias one 4 KiB, 16-bit by-offset DOCA doorbell
@@ -35,7 +35,7 @@
  * CQ/SQ/RQ use their existing DMA doorbell records for full queue state.
  */
 #define VFIO_ADMINQ_TLP_REGION_OFFSET VFIO_ADMINQ_BAR0_CFG_OFFSET
-#define VFIO_ADMINQ_TLP_REGION_SIZE VFIO_ADMINQ_BAR0_CFG_SIZE
+#define VFIO_ADMINQ_TLP_REGION_SIZE UINT32_C(0x8000)
 #define VFIO_ADMINQ_DB_REGION_OFFSET VFIO_ADMINQ_UAR_BASE_OFFSET
 #define VFIO_ADMINQ_DB_REGION_SIZE UINT32_C(0x1000)
 #define VFIO_ADMINQ_DB_LOG_SIZE 1U
@@ -138,6 +138,57 @@ enum vfio_adminq_gemini_client_type {
 
 #define DPU_FPGA_SRDMA_MSIX_ARRAY_NR 8U
 
+/* io-engine compatible Gemini SCAN shared-memory layout. */
+#define VFIO_ADMINQ_SHM_ALIGN 0x1000U
+#define VFIO_ADMINQ_SHM_CONFIG_OFFSET 0x0000U
+#define VFIO_ADMINQ_SHM_CONFIG_LENGTH 0x1000U
+#define VFIO_ADMINQ_SHM_DB_OFFSET 0x1000U
+#define VFIO_ADMINQ_SHM_DB_LENGTH 0x1000U
+/* pci-fe-private MSI-X backing storage; not advertised by Gemini SCAN. */
+#define VFIO_ADMINQ_SHM_MSIX_OFFSET 0x2000U
+#define VFIO_ADMINQ_SHM_MSIX_LENGTH \
+    (VFIO_ADMINQ_MSIX_TABLE_SIZE + VFIO_ADMINQ_MSIX_PBA_SIZE)
+#define VFIO_ADMINQ_SHM_SIZE 0x3000U
+#define VFIO_ADMINQ_MSIX_ENTRY_SIZE 16U
+#define VFIO_ADMINQ_MSIX_ENTRY_MASKED (1U << 0)
+#define VFIO_ADMINQ_MSIX_CTRL_MASK (1U << 0)
+#define VFIO_ADMINQ_MSIX_CTRL_DISABLE (1U << 1)
+
+struct vfio_adminq_msix_entry {
+    uint32_t addr_lo;
+    uint32_t addr_hi;
+    uint32_t data;
+    uint32_t vector_ctrl;
+};
+
+/* Binary-compatible with io-engine BES2SRDMACfg. */
+struct vfio_adminq_srdma_config {
+    struct {
+        uint64_t msix_addr;
+        uint32_t msix_data;
+        uint32_t control;
+    } __attribute__((packed)) msix_vec0;
+    uint8_t diag_regs[SRDMA_BFA_PCI_DEV_DIAG_SIZE];
+} __attribute__((packed));
+
+struct vfio_adminq_shared_msix {
+    struct vfio_adminq_msix_entry table[VFIO_ADMINQ_NUM_MSIX];
+    uint64_t pba[VFIO_ADMINQ_NUM_MSIX / 64U];
+};
+
+struct srdma_gemini_scan_result {
+    uint64_t shm_size;
+    uint64_t shm_align;
+    struct {
+        uint64_t length;
+        uint64_t offset;
+        uint64_t msix_offset;
+        uint32_t msix_length;
+        uint32_t reserved;
+        uint64_t db_offset;
+    } __attribute__((packed)) srdma_config;
+} __attribute__((packed));
+
 struct srdma_gemini_hello_msg {
     uint8_t type;
 } __attribute__((packed));
@@ -182,6 +233,7 @@ struct srdma_gemini_msg {
         uint8_t u8;
         uint16_t u16;
         struct srdma_gemini_hello_msg hello;
+        struct srdma_gemini_scan_result scan;
         struct srdma_gemini_srdma_plug_msg srdma_plug;
         struct srdma_gemini_srdma_start_msg srdma_start;
         uint8_t raw[SRDMA_GEMINI_PAYLOAD_SIZE];
@@ -222,3 +274,30 @@ _Static_assert(sizeof(struct srdma_gemini_srdma_start_msg) == 116,
                "unexpected Gemini SRDMA START size");
 _Static_assert(sizeof(struct srdma_adminq_test_msg) == SRDMA_ADMINQ_TEST_LEN,
                "unexpected AdminQ test message size");
+_Static_assert(sizeof(struct vfio_adminq_msix_entry) ==
+                   VFIO_ADMINQ_MSIX_ENTRY_SIZE,
+               "unexpected MSI-X entry size");
+_Static_assert(sizeof(struct vfio_adminq_srdma_config) == 80,
+               "unexpected io-engine SRDMA shared config size");
+_Static_assert(sizeof(((struct vfio_adminq_shared_msix *)0)->table) ==
+                   VFIO_ADMINQ_MSIX_TABLE_SIZE,
+               "shared MSI-X table size does not match BAR0 layout");
+_Static_assert(sizeof(((struct vfio_adminq_shared_msix *)0)->pba) ==
+                   VFIO_ADMINQ_MSIX_PBA_SIZE,
+               "shared MSI-X PBA size does not match BAR0 layout");
+_Static_assert(sizeof(struct vfio_adminq_shared_msix) ==
+                   VFIO_ADMINQ_SHM_MSIX_LENGTH,
+               "unexpected shared MSI-X region size");
+_Static_assert(VFIO_ADMINQ_SHM_CONFIG_OFFSET +
+                       VFIO_ADMINQ_SHM_CONFIG_LENGTH <=
+                   VFIO_ADMINQ_SHM_DB_OFFSET,
+               "SRDMA config and DB shared regions overlap");
+_Static_assert(VFIO_ADMINQ_SHM_DB_OFFSET + VFIO_ADMINQ_SHM_DB_LENGTH <=
+                   VFIO_ADMINQ_SHM_MSIX_OFFSET,
+               "SRDMA DB and MSI-X shared regions overlap");
+_Static_assert(VFIO_ADMINQ_SHM_MSIX_OFFSET +
+                       VFIO_ADMINQ_SHM_MSIX_LENGTH <=
+                   VFIO_ADMINQ_SHM_SIZE,
+               "SRDMA MSI-X shared region exceeds memfd");
+_Static_assert(sizeof(struct srdma_gemini_scan_result) == 56,
+               "unexpected Gemini SRDMA SCAN result size");
