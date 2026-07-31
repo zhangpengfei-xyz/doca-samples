@@ -89,6 +89,7 @@ struct srdma_backend_resources {
     bool logger_ready;
     bool adminq_ready;
     uint32_t initial_db_pending;
+    uint32_t dma_timeout_ms;
     bool pci_type_started;
     bool tlp_dev_started;
     bool dpa_started;
@@ -99,11 +100,15 @@ struct srdma_backend_resources {
     bool msgq_started;
     bool host_consumer_started;
     bool dpa_producer_started;
+    bool dma_failed;
 };
 
 struct srdma_dma_sync_state {
     doca_error_t result;
     uint32_t remaining_tasks;
+    struct doca_buf *src_buf;
+    struct doca_buf *dst_buf;
+    bool detached;
 };
 
 static struct srdma_backend_resources g_res;
@@ -161,6 +166,7 @@ void srdma_backend_default_opts(struct srdma_backend_opts *opts)
     opts->vhca_id = SRDMA_DPU_DEFAULT_VHCA_ID;
     opts->num_db = SRDMA_DPU_DEFAULT_DB_COUNT;
     opts->local_dma_size = SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE;
+    opts->dma_timeout_ms = SRDMA_DPU_DEFAULT_DMA_TIMEOUT_MS;
 }
 
 static doca_error_t init_logging(void)
@@ -459,6 +465,11 @@ static void dma_completed_cb(struct doca_dma_task_memcpy *dma_task,
     if (state != NULL) {
         state->result = DOCA_SUCCESS;
         state->remaining_tasks--;
+        if (state->detached) {
+            (void)doca_buf_dec_refcount(state->dst_buf, NULL);
+            (void)doca_buf_dec_refcount(state->src_buf, NULL);
+            free(state);
+        }
     }
     doca_task_free(doca_dma_task_memcpy_as_task(dma_task));
 }
@@ -474,6 +485,11 @@ static void dma_error_cb(struct doca_dma_task_memcpy *dma_task,
     if (state != NULL) {
         state->result = doca_task_get_status(task);
         state->remaining_tasks--;
+        if (state->detached) {
+            (void)doca_buf_dec_refcount(state->dst_buf, NULL);
+            (void)doca_buf_dec_refcount(state->src_buf, NULL);
+            free(state);
+        }
     }
     doca_task_free(task);
 }
@@ -555,34 +571,42 @@ static doca_error_t srdma_dma_copy(struct doca_mmap *src_mmap, void *src_addr,
         .tv_sec = 0,
         .tv_nsec = 1000 * 1000,
     };
-    struct srdma_dma_sync_state sync_state = {
-        .result = DOCA_ERROR_IN_PROGRESS,
-        .remaining_tasks = 1,
-    };
-    union doca_data task_user_data = {
-        .ptr = &sync_state,
-    };
-    struct doca_buf *src_buf = NULL;
-    struct doca_buf *dst_buf = NULL;
+    struct srdma_dma_sync_state *sync_state;
+    union doca_data task_user_data;
     struct doca_dma_task_memcpy *dma_task = NULL;
     struct doca_task *task;
+    struct timespec now;
+    uint64_t deadline_ns;
     doca_error_t result;
 
+    if (g_res.dma_failed)
+        return DOCA_ERROR_BAD_STATE;
+    sync_state = calloc(1, sizeof(*sync_state));
+    if (sync_state == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    sync_state->result = DOCA_ERROR_IN_PROGRESS;
+    sync_state->remaining_tasks = 1;
+    task_user_data.ptr = sync_state;
+
     result = doca_buf_inventory_buf_get_by_addr(g_res.buf_inv, src_mmap,
-                                                src_addr, len, &src_buf);
+                                                src_addr, len,
+                                                &sync_state->src_buf);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to acquire source DMA buffer", result);
-        return result;
+        goto out_state;
     }
 
     result = doca_buf_inventory_buf_get_by_addr(g_res.buf_inv, dst_mmap,
-                                                dst_addr, len, &dst_buf);
+                                                dst_addr, len,
+                                                &sync_state->dst_buf);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to acquire destination DMA buffer", result);
         goto out_src;
     }
 
-    result = doca_dma_task_memcpy_alloc_init(g_res.dma_ctx, src_buf, dst_buf,
+    result = doca_dma_task_memcpy_alloc_init(g_res.dma_ctx,
+                                             sync_state->src_buf,
+                                             sync_state->dst_buf,
                                              task_user_data, &dma_task);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to allocate DMA memcpy task", result);
@@ -590,7 +614,7 @@ static doca_error_t srdma_dma_copy(struct doca_mmap *src_mmap, void *src_addr,
     }
 
     task = doca_dma_task_memcpy_as_task(dma_task);
-    result = doca_buf_set_data(src_buf, src_addr, len);
+    result = doca_buf_set_data(sync_state->src_buf, src_addr, len);
     if (result != DOCA_SUCCESS) {
         log_doca_error("failed to set source DMA data", result);
         doca_task_free(task);
@@ -604,28 +628,52 @@ static doca_error_t srdma_dma_copy(struct doca_mmap *src_mmap, void *src_addr,
         goto out_dst;
     }
 
-    while (sync_state.remaining_tasks != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        result = DOCA_ERROR_OPERATING_SYSTEM;
+        goto submitted_timeout;
+    }
+    deadline_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec +
+                  (uint64_t)g_res.dma_timeout_ms * UINT64_C(1000000);
+    while (sync_state->remaining_tasks != 0) {
         while (doca_pe_progress(g_res.dma_pe) != 0) {
         }
-        if (sync_state.remaining_tasks == 0) {
+        if (sync_state->remaining_tasks == 0) {
             break;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec >=
+                deadline_ns) {
+            result = DOCA_ERROR_TIME_OUT;
+            goto submitted_timeout;
         }
         (void)nanosleep(&sleep_time, NULL);
     }
 
-    result = sync_state.result;
+    result = sync_state->result;
     if (result != DOCA_SUCCESS) {
         log_doca_error("DMA memcpy completed with error", result);
     }
+    goto out_dst;
+
+submitted_timeout:
+    DOCA_LOG_ERR("DMA memcpy timed out after %u ms: src=%p dst=%p len=%zu",
+                 g_res.dma_timeout_ms, src_addr, dst_addr, len);
+    g_res.dma_failed = true;
+    sync_state->detached = true;
+    (void)doca_ctx_stop(doca_dma_as_ctx(g_res.dma_ctx));
+    for (unsigned int i = 0; i < 100; i++)
+        while (doca_pe_progress(g_res.dma_pe) != 0) {
+        }
+    return result;
 
 out_dst:
-    if (dst_buf != NULL) {
-        (void)doca_buf_dec_refcount(dst_buf, NULL);
-    }
+    if (sync_state->dst_buf != NULL)
+        (void)doca_buf_dec_refcount(sync_state->dst_buf, NULL);
 out_src:
-    if (src_buf != NULL) {
-        (void)doca_buf_dec_refcount(src_buf, NULL);
-    }
+    if (sync_state->src_buf != NULL)
+        (void)doca_buf_dec_refcount(sync_state->src_buf, NULL);
+out_state:
+    free(sync_state);
     return result;
 }
 
@@ -1225,6 +1273,7 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
     if (opts == NULL || opts->pci_addr == NULL || opts->pci_type_name == NULL ||
         opts->local_dma_size < SRDMA_ADMIN_ENTRY_SIZE ||
         opts->num_db != VFIO_ADMINQ_DB_COUNT ||
+        opts->dma_timeout_ms == 0 ||
         opts->shared_config == NULL) {
         return DOCA_ERROR_INVALID_VALUE;
     }
@@ -1247,6 +1296,8 @@ doca_error_t srdma_backend_init(const struct srdma_backend_opts *opts)
     g_res.shared_config = opts->shared_config;
     g_res.adminq_ready = false;
     g_res.initial_db_pending = 0;
+    g_res.dma_timeout_ms = opts->dma_timeout_ms;
+    g_res.dma_failed = false;
     srdma_admin_init(&g_res.admin, (uint32_t)g_res.generation);
 
     result = find_supported_tlp_device(opts->pci_addr, &g_res.dev);
@@ -1590,6 +1641,27 @@ void srdma_backend_cleanup(void)
         g_res.pe = NULL;
     }
 
+    /* Stop DMA before releasing task buffers, inventory, and memory maps. */
+    if (g_res.dma_ctx != NULL) {
+        struct doca_ctx *ctx = doca_dma_as_ctx(g_res.dma_ctx);
+
+        result = stop_ctx_with_progress(ctx, g_res.dma_pe,
+                                        "failed to stop DMA context");
+        if (result != DOCA_SUCCESS && result != DOCA_ERROR_BAD_STATE)
+            log_doca_error("failed to quiesce DMA context", result);
+        result = doca_dma_destroy(g_res.dma_ctx);
+        if (result != DOCA_SUCCESS)
+            log_doca_error("failed to destroy DMA context", result);
+        g_res.dma_ctx = NULL;
+    }
+
+    if (g_res.dma_pe != NULL) {
+        result = doca_pe_destroy(g_res.dma_pe);
+        if (result != DOCA_SUCCESS)
+            log_doca_error("failed to destroy DMA PE", result);
+        g_res.dma_pe = NULL;
+    }
+
     if (g_res.buf_inv != NULL) {
         result = doca_buf_inventory_destroy(g_res.buf_inv);
         if (result != DOCA_SUCCESS) {
@@ -1626,27 +1698,6 @@ void srdma_backend_cleanup(void)
             log_doca_error("failed to destroy remote mmap", result);
         }
         g_res.remote_mmap = NULL;
-    }
-
-    if (g_res.dma_ctx != NULL) {
-        struct doca_ctx *ctx = doca_dma_as_ctx(g_res.dma_ctx);
-        result = doca_ctx_stop(ctx);
-        if (result != DOCA_SUCCESS && result != DOCA_ERROR_BAD_STATE) {
-            log_doca_error("failed to stop DMA context", result);
-        }
-        result = doca_dma_destroy(g_res.dma_ctx);
-        if (result != DOCA_SUCCESS) {
-            log_doca_error("failed to destroy DMA context", result);
-        }
-        g_res.dma_ctx = NULL;
-    }
-
-    if (g_res.dma_pe != NULL) {
-        result = doca_pe_destroy(g_res.dma_pe);
-        if (result != DOCA_SUCCESS) {
-            log_doca_error("failed to destroy DMA PE", result);
-        }
-        g_res.dma_pe = NULL;
     }
 
     if (g_res.dma_dev != NULL) {

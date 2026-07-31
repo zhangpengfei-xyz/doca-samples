@@ -12,6 +12,7 @@
 #define SRDMA_DPU_DEFAULT_VHCA_ID 7
 #define SRDMA_DPU_DEFAULT_DB_COUNT VFIO_ADMINQ_DB_COUNT
 #define SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE 4096
+#define SRDMA_DPU_DEFAULT_DMA_TIMEOUT_MS 5000U
 
 struct srdma_backend_opts {
     const char *pci_addr;
@@ -20,6 +21,7 @@ struct srdma_backend_opts {
     uint16_t num_db;
     size_t local_dma_size;
     uint32_t timeout_sec;
+    uint32_t dma_timeout_ms;
     uint64_t generation;
     struct vfio_adminq_srdma_config *shared_config;
 };

@@ -51,6 +51,7 @@ struct pci_fe {
     bool pci_type_started;
     bool tlp_dev_started;
     bool channel_started;
+    bool channel_recovery_needed;
     bool ready;
     bool init_done;
     bool bar_probe_low;
@@ -67,16 +68,18 @@ struct pci_fe {
     uint32_t asyncq_depth;
     uint16_t vhca_id;
     uint16_t bdf;
+    uint16_t exposed_msix;
     uint8_t mac[6];
     uint64_t generation;
-    uint64_t tlp_sequence;
     uint32_t heartbeat;
     uint64_t heartbeat_last_ns;
+    uint64_t channel_recovery_last_ns;
+    uint32_t channel_recovery_attempts;
 };
 
 doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
                          struct gemini_server *gemini,
-                         const uint8_t mac[6]);
+                         uint16_t exposed_msix, const uint8_t mac[6]);
 void pci_fe_cleanup(struct pci_fe *fe);
 void pci_fe_progress(struct pci_fe *fe);
 int pci_fe_plug(struct pci_fe *fe);
