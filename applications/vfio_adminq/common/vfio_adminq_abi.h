@@ -28,6 +28,7 @@
 #define VFIO_ADMINQ_UAR_PAGE_SIZE 0x1000U
 #define VFIO_ADMINQ_UAR_MAX_ID 15U
 #define VFIO_ADMINQ_NUM_MSIX 128U
+#define VFIO_ADMINQ_DEFAULT_EXPOSED_MSIX VFIO_ADMINQ_NUM_MSIX
 
 /*
  * All supported UAR contexts alias one 4 KiB, 16-bit by-offset DOCA doorbell

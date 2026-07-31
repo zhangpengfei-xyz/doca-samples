@@ -26,11 +26,14 @@ static void print_usage(const char *prog)
            "(default: %s)\n"
            "  --timeout-sec <n>       serve timeout; 0 means forever "
            "(default: %u)\n"
+           "  --dma-timeout-ms <n>    individual DMA timeout "
+           "(default: %u)\n"
            "  -h, --help              show this help\n",
            prog, SRDMA_DPU_DEFAULT_PCI_ADDR,
            SRDMA_DPU_DEFAULT_PCI_TYPE_NAME,
            SRDMA_DPU_DEFAULT_DB_COUNT, SRDMA_DPU_DEFAULT_LOCAL_DMA_SIZE,
-           SRDMA_GEMINI_DEFAULT_SOCKET, 0);
+           SRDMA_GEMINI_DEFAULT_SOCKET, 0,
+           SRDMA_DPU_DEFAULT_DMA_TIMEOUT_MS);
 }
 
 static int parse_u16(const char *name, const char *value, uint16_t *out)
@@ -92,6 +95,7 @@ static int parse_args(int argc, char **argv,
         {"local-dma-size", required_argument, NULL, 's'},
         {"socket", required_argument, NULL, 'g'},
         {"timeout-sec", required_argument, NULL, 'T'},
+        {"dma-timeout-ms", required_argument, NULL, 'D'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -121,6 +125,13 @@ static int parse_args(int argc, char **argv,
             break;
         case 'T':
             if (parse_u32("timeout-sec", optarg, &opts->timeout_sec) != 0) {
+                return -1;
+            }
+            break;
+        case 'D':
+            if (parse_u32("dma-timeout-ms", optarg,
+                          &opts->dma_timeout_ms) != 0 ||
+                opts->dma_timeout_ms == 0) {
                 return -1;
             }
             break;

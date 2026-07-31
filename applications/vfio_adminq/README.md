@@ -16,8 +16,9 @@
   DPA doorbell completion 和 MSI-X。
 - `vfio_adminq_host_emu`：Host 侧 VFIO 测试程序，负责 AdminQ DMA/DB 闭环。
 
-v2 只支持一个 endpoint，提供 128-depth AdminQ、128 个 MSI-X vector 和
-UCTX/PD/MR/EQ/CQ/QP 控制面；不实现 RoCE 数据面。
+v2 只支持一个 endpoint，提供 128-depth AdminQ、最多 128 个 MSI-X vector 和
+UCTX/PD/MR/EQ/CQ/QP 控制面；不实现 RoCE 数据面。Host 可见向量数由
+`pci-fe --num-msix` 选择，默认 128。
 
 ## DPU 构建
 
@@ -119,7 +120,8 @@ applications/build/vfio_adminq/doca_vfio_adminq_pci_fe serve \
 cd /root/ByteDance/doca-samples
 applications/build/vfio_adminq/doca_vfio_adminq_dev_be serve \
   --pci-addr 0000:03:00.0 \
-  --socket /var/tmp/bes2/bes2-server.sock
+  --socket /var/tmp/bes2/bes2-server.sock \
+  --dma-timeout-ms 5000
 ```
 
 第三个 DPU 终端执行 plug：
@@ -162,8 +164,8 @@ rdma link show srdma_0/1
 ibv_devinfo -d srdma_0
 ```
 
-期望 `srdma_0/1 state ACTIVE`、`netdev eth0`。PCI 配置应报告一个 64 KiB BAR0 和
-128-entry MSI-X capability；DOCA type 的 BAR0 aperture 为 1 MiB。MSI-X table/PBA
+期望 `srdma_0/1 state ACTIVE`、`netdev eth0`。PCI 配置应报告一个 64 KiB BAR0 和与
+`--num-msix` 一致的 MSI-X capability；DOCA type 的 BAR0 aperture 为 1 MiB。MSI-X table/PBA
 位于 transaction region，由 `pci-fe` 软件处理；control path 的 vector 0 address/data
 同步给 `dev-be`，由后者直接 DMA 写 MSI-X address。
 
@@ -261,3 +263,19 @@ host-emu/unbind-vfio.sh 0000:46:00.0
 `/var/tmp/bes2/bes2-server.sock`，默认控制 socket 是
 `/run/vfio-adminq/pci-fe.sock`。`pci-fe` 的默认 DOCA PCI 地址为
 `0000:03:00.0`；实际部署应使用已验证环境对应的地址。
+
+- `pci-fe --num-msix N`：Host 可见向量数，范围 `1..128`，默认 128。
+- `dev-be --dma-timeout-ms N`：单次 DMA 的硬超时，默认 5000 ms。超时后停止 DMA
+  context 并返回错误，不再无限等待。
+
+## 大向量数 MSI-X 说明
+
+Linux `pci_alloc_irq_vectors()` 会先 mask 整张 MSI-X table，再连续写入每个 message
+entry。由于本项目的 table 位于 software transaction region，64-vector probe 会形成
+一批密集 TLP request。TLP request callback 只做有界处理和 completion，禁止在回调
+内逐包同步打印或进行磁盘 I/O；PE owner loop 的最大空闲 poll 为 1 ms。
+
+旧实现的逐 TLP `DOCA_LOG_INFO` 加 10 ms poll 会在 64-vector 突发下破坏 forward
+progress；2/32 vector 仅因突发规模较小而未触发。dev-be 旧的无界同步 DMA 等待会把
+该阻塞进一步放大成 AdminQ、Host 与 DPU 看似同时卡死。当前默认暴露 128 vectors；
+如果 TLP channel 进入 fatal，主循环会在回调外 stop/destroy/recreate channel。

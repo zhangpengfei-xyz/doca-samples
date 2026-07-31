@@ -44,12 +44,6 @@ DOCA_LOG_REGISTER(VFIO_ADMINQ_PCI_FE);
 #define PCI_BAR0_LOW_MASK 0xffff0000U
 #define PCI_CONFIG_DWORDS (sizeof(((struct pci_fe *)0)->config_space) / 4U)
 
-/* The MSI-X table/PBA are software-owned transaction-region data. */
-#define VFIO_ADMINQ_EXPOSED_MSIX 32U
-
-_Static_assert(VFIO_ADMINQ_EXPOSED_MSIX <= VFIO_ADMINQ_NUM_MSIX,
-               "Host-visible MSI-X count exceeds backing table storage");
-
 #define SRDMA_HEALTH_MAC0_ALIVE (1U << 0)
 #define SRDMA_HEALTH_MAC1_ALIVE (1U << 1)
 
@@ -88,26 +82,6 @@ enum pci_fe_tlp_kind {
     PCI_FE_TLP_CFGRD1,
     PCI_FE_TLP_CFGWR1,
 };
-
-static const char *tlp_kind_name(enum pci_fe_tlp_kind kind)
-{
-    switch (kind) {
-    case PCI_FE_TLP_MRD:
-        return "MRd";
-    case PCI_FE_TLP_MWR:
-        return "MWr";
-    case PCI_FE_TLP_CFGRD0:
-        return "CfgRd0";
-    case PCI_FE_TLP_CFGWR0:
-        return "CfgWr0";
-    case PCI_FE_TLP_CFGRD1:
-        return "CfgRd1";
-    case PCI_FE_TLP_CFGWR1:
-        return "CfgWr1";
-    default:
-        return "invalid";
-    }
-}
 
 static uint32_t byte_enable_mask(uint8_t be)
 {
@@ -185,7 +159,7 @@ static void init_config_space(struct pci_fe *fe)
     store_config_dword(fe, PCI_SUBSYSTEM_OFFSET / 4U, value);
     store_config_dword(fe, PCI_CAP_PTR_OFFSET / 4U, PCI_MSIX_CAP_OFFSET);
     value = PCI_MSIX_CAP_ID | (PCI_EXP_CAP_OFFSET << 8) |
-            ((VFIO_ADMINQ_EXPOSED_MSIX - 1U) << 16);
+            (((uint32_t)fe->exposed_msix - 1U) << 16);
     store_config_dword(fe, PCI_MSIX_CAP_OFFSET / 4U, value);
     store_config_dword(fe, PCI_MSIX_CAP_OFFSET / 4U + 1U,
                        VFIO_ADMINQ_MSIX_TABLE_OFFSET | VFIO_ADMINQ_BAR0_ID);
@@ -276,7 +250,7 @@ static uint32_t bar0_config_read32(const struct pci_fe *fe, uint32_t offset)
     case SRDMA_BFA_MAX_QP_NUM:
         return 128;
     case SRDMA_BFA_PCI_MAX_VECTORS:
-        return VFIO_ADMINQ_EXPOSED_MSIX;
+        return fe->exposed_msix;
     case SRDMA_BFA_PCI_DEV_MACADDR:
         return (uint32_t)fe->mac[5] | ((uint32_t)fe->mac[4] << 8) |
                ((uint32_t)fe->mac[3] << 16) | ((uint32_t)fe->mac[2] << 24);
@@ -715,38 +689,13 @@ static void handle_tlp_request(struct doca_devemu_pci_tlp_channel_req *req,
                                struct pci_fe *fe)
 {
     const void *header = doca_devemu_pci_tlp_channel_req_get_tlp_header(req);
-    const uint32_t *data;
     enum pci_fe_tlp_kind kind;
-    uint64_t sequence;
 
     if (header == NULL || fe->tlp_dev == NULL) {
         doca_devemu_pci_tlp_channel_req_complete_tlp(req, 0, NULL);
         return;
     }
     kind = get_tlp_kind(header);
-    sequence = ++fe->tlp_sequence;
-    data = doca_devemu_pci_tlp_channel_req_get_tlp_data(req);
-    if (kind == PCI_FE_TLP_CFGRD0 || kind == PCI_FE_TLP_CFGWR0 ||
-        kind == PCI_FE_TLP_CFGRD1 || kind == PCI_FE_TLP_CFGWR1) {
-        DOCA_LOG_INFO("TLP #%" PRIu64 " %s bdf=%02x:%02x.%x reg=0x%03x "
-                      "len=%u first_be=0x%x last_be=0x%x data0=0x%08x",
-                      sequence, tlp_kind_name(kind), GET_TLP_BUS(header),
-                      GET_TLP_DEVICE(header), GET_TLP_FUNCTION(header),
-                      GET_TLP_EXT_REG(header) * 4U, GET_TLP_LENGTH(header),
-                      GET_TLP_FIRST_BE(header), GET_TLP_LAST_BE(header),
-                      data != NULL ? data[0] : 0);
-    } else if (kind == PCI_FE_TLP_MRD || kind == PCI_FE_TLP_MWR) {
-        DOCA_LOG_INFO("TLP #%" PRIu64 " %s addr=0x%" PRIx64
-                      " len=%u first_be=0x%x last_be=0x%x data0=0x%08x",
-                      sequence, tlp_kind_name(kind), tlp_memory_address(header),
-                      GET_TLP_LENGTH(header), GET_TLP_FIRST_BE(header),
-                      GET_TLP_LAST_BE(header), data != NULL ? data[0] : 0);
-    } else {
-        DOCA_LOG_WARN("TLP #%" PRIu64 " unsupported fmt=0x%x type=0x%x "
-                      "len=%u",
-                      sequence, GET_TLP_FMT(header), GET_TLP_TYPE(header),
-                      GET_TLP_LENGTH(header));
-    }
     switch (kind) {
     case PCI_FE_TLP_CFGRD0:
     case PCI_FE_TLP_CFGWR0:
@@ -788,9 +737,32 @@ static void handle_pci_event(struct doca_devemu_pci_tlp_channel_req *req,
 static void tlp_fatal_state_cb(struct doca_devemu_pci_tlp_channel *channel,
                                union doca_data user_data)
 {
+    struct pci_fe *fe = user_data.ptr;
+
     (void)channel;
-    (void)user_data;
-    DOCA_LOG_ERR("TLP channel entered fatal state");
+    if (fe == NULL)
+        return;
+    fe->channel_recovery_needed = true;
+}
+
+static void complete_request_without_context(
+    struct doca_devemu_pci_tlp_channel_req *req,
+    enum doca_devemu_pci_tlp_channel_req_opcode opcode)
+{
+    switch (opcode) {
+    case DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_TLP:
+        doca_devemu_pci_tlp_channel_req_complete_tlp(req, 0, NULL);
+        break;
+    case DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_ACG:
+        doca_devemu_pci_tlp_channel_req_complete_acg(
+            req, 0, DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_ACG_COMP_OPMODE_FLUSH);
+        break;
+    case DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_PCI_EVENT:
+        doca_devemu_pci_tlp_channel_req_complete_pci_event(req);
+        break;
+    default:
+        break;
+    }
 }
 
 static void tlp_request_cb(struct doca_devemu_pci_tlp_channel *channel,
@@ -802,17 +774,22 @@ static void tlp_request_cb(struct doca_devemu_pci_tlp_channel *channel,
     enum doca_devemu_pci_tlp_channel_req_opcode opcode;
 
     (void)req_user_data;
-    if (doca_ctx_get_user_data(doca_devemu_pci_tlp_channel_as_ctx(channel),
-                               &user_data) != DOCA_SUCCESS)
-        return;
-    fe = user_data.ptr;
     opcode = doca_devemu_pci_tlp_channel_req_get_opcode(req);
-    if (opcode == DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_PCI_EVENT)
+    if (doca_ctx_get_user_data(doca_devemu_pci_tlp_channel_as_ctx(channel),
+                               &user_data) != DOCA_SUCCESS ||
+        user_data.ptr == NULL) {
+        complete_request_without_context(req, opcode);
+        return;
+    }
+    fe = user_data.ptr;
+    if (opcode == DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_PCI_EVENT) {
         handle_pci_event(req, fe);
-    else if (opcode == DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_TLP)
+    } else if (opcode == DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_TLP) {
         handle_tlp_request(req, fe);
-    else
-        DOCA_LOG_WARN("unsupported TLP channel opcode %d", opcode);
+    } else if (opcode == DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_OPCODE_ACG) {
+        doca_devemu_pci_tlp_channel_req_complete_acg(
+            req, 0, DOCA_DEVEMU_PCI_TLP_CHANNEL_REQ_ACG_COMP_OPMODE_FLUSH);
+    }
 }
 
 static doca_error_t find_tlp_device(const char *pci_addr,
@@ -860,7 +837,7 @@ static doca_error_t init_pci_type(struct pci_fe *fe)
         return result;
     DOCA_LOG_INFO("software MSI-X model: DOCA type num_msix=%u, "
                   "Host-visible vectors=%u", configured_msix,
-                  VFIO_ADMINQ_EXPOSED_MSIX);
+                  fe->exposed_msix);
     result = doca_devemu_pci_type_set_num_db(fe->pci_type,
                                               VFIO_ADMINQ_DB_COUNT);
     if (result != DOCA_SUCCESS) {
@@ -930,9 +907,11 @@ static doca_error_t init_tlp_channel(struct pci_fe *fe)
     uint8_t num_dsp = 0;
     doca_error_t result;
 
-    result = doca_pe_create(&fe->pe);
-    if (result != DOCA_SUCCESS)
-        return result;
+    if (fe->pe == NULL) {
+        result = doca_pe_create(&fe->pe);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
     result = doca_devemu_pci_tlp_channel_create(fe->dev, &fe->tlp_channel);
     if (result != DOCA_SUCCESS)
         return result;
@@ -974,6 +953,75 @@ static doca_error_t init_tlp_channel(struct pci_fe *fe)
         return DOCA_ERROR_NOT_SUPPORTED;
     }
     return DOCA_SUCCESS;
+}
+
+static doca_error_t destroy_tlp_channel(struct pci_fe *fe)
+{
+    enum doca_ctx_states state = DOCA_CTX_STATE_RUNNING;
+    doca_error_t first_error = DOCA_SUCCESS;
+    doca_error_t result;
+
+    if (fe->channel_ctx != NULL && fe->channel_started) {
+        result = doca_ctx_stop(fe->channel_ctx);
+        if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS &&
+            result != DOCA_ERROR_BAD_STATE)
+            first_error = result;
+        for (unsigned int i = 0; i < 1000; i++) {
+            while (fe->pe != NULL && doca_pe_progress(fe->pe) != 0) {
+            }
+            if (doca_ctx_get_state(fe->channel_ctx, &state) == DOCA_SUCCESS &&
+                state == DOCA_CTX_STATE_IDLE)
+                break;
+            (void)nanosleep(&(const struct timespec){
+                                .tv_nsec = 1000 * 1000,
+                            },
+                            NULL);
+        }
+        if (state != DOCA_CTX_STATE_IDLE && first_error == DOCA_SUCCESS)
+            first_error = DOCA_ERROR_TIME_OUT;
+        fe->channel_started = false;
+    }
+    if (fe->tlp_channel != NULL) {
+        result = doca_devemu_pci_tlp_channel_destroy(fe->tlp_channel);
+        if (result == DOCA_SUCCESS) {
+            fe->tlp_channel = NULL;
+            fe->channel_ctx = NULL;
+        } else if (first_error == DOCA_SUCCESS) {
+            first_error = result;
+        }
+    }
+    if (fe->tlp_channel == NULL && fe->pe != NULL) {
+        result = doca_pe_destroy(fe->pe);
+        if (result == DOCA_SUCCESS)
+            fe->pe = NULL;
+        else if (first_error == DOCA_SUCCESS)
+            first_error = result;
+    }
+    return first_error;
+}
+
+static void recover_tlp_channel(struct pci_fe *fe, uint64_t now_ns)
+{
+    doca_error_t result;
+
+    if (!fe->channel_recovery_needed ||
+        (fe->channel_recovery_last_ns != 0 &&
+         now_ns - fe->channel_recovery_last_ns < UINT64_C(100000000)))
+        return;
+    fe->channel_recovery_last_ns = now_ns;
+    fe->channel_recovery_attempts++;
+    DOCA_LOG_ERR("recovering fatal TLP channel (attempt %u)",
+                 fe->channel_recovery_attempts);
+    result = destroy_tlp_channel(fe);
+    if (result == DOCA_SUCCESS)
+        result = init_tlp_channel(fe);
+    if (result == DOCA_SUCCESS) {
+        fe->channel_recovery_needed = false;
+        DOCA_LOG_INFO("fatal TLP channel recovery succeeded");
+    } else {
+        DOCA_LOG_ERR("fatal TLP channel recovery failed: %s",
+                     doca_error_get_descr(result));
+    }
 }
 
 static void progress_cb(void *opaque)
@@ -1033,14 +1081,17 @@ static doca_error_t create_endpoint(struct pci_fe *fe)
 
 doca_error_t pci_fe_init(struct pci_fe *fe, const char *pci_addr,
                          struct gemini_server *gemini,
-                         const uint8_t mac[6])
+                         uint16_t exposed_msix, const uint8_t mac[6])
 {
     doca_error_t result;
 
-    if (fe == NULL || pci_addr == NULL || gemini == NULL || mac == NULL)
+    if (fe == NULL || pci_addr == NULL || gemini == NULL || mac == NULL ||
+        exposed_msix == 0 ||
+        exposed_msix > VFIO_ADMINQ_NUM_MSIX)
         return DOCA_ERROR_INVALID_VALUE;
     memset(fe, 0, sizeof(*fe));
     fe->gemini = gemini;
+    fe->exposed_msix = exposed_msix;
     void *shared_base = gemini_server_shared_state(gemini);
 
     if (shared_base == NULL)
@@ -1073,36 +1124,12 @@ fail:
 
 void pci_fe_cleanup(struct pci_fe *fe)
 {
-    enum doca_ctx_states state;
-
     if (fe == NULL)
         return;
     if (fe->state != PCI_FE_ABSENT)
         (void)pci_fe_unplug(fe, true);
     destroy_endpoint(fe);
-    if (fe->channel_ctx != NULL && fe->channel_started) {
-        doca_error_t result = doca_ctx_stop(fe->channel_ctx);
-
-        if (result == DOCA_ERROR_IN_PROGRESS) {
-            for (unsigned int i = 0; i < 10000; i++) {
-                while (fe->pe != NULL && doca_pe_progress(fe->pe) != 0) {
-                }
-                if (doca_ctx_get_state(fe->channel_ctx, &state) == DOCA_SUCCESS &&
-                    state == DOCA_CTX_STATE_IDLE)
-                    break;
-            }
-        }
-        fe->channel_started = false;
-    }
-    if (fe->tlp_channel != NULL) {
-        (void)doca_devemu_pci_tlp_channel_destroy(fe->tlp_channel);
-        fe->tlp_channel = NULL;
-        fe->channel_ctx = NULL;
-    }
-    if (fe->pe != NULL) {
-        (void)doca_pe_destroy(fe->pe);
-        fe->pe = NULL;
-    }
+    (void)destroy_tlp_channel(fe);
     if (fe->pci_type != NULL) {
         if (fe->pci_type_started)
             (void)doca_devemu_pci_type_stop(fe->pci_type);
@@ -1119,13 +1146,14 @@ void pci_fe_cleanup(struct pci_fe *fe)
 
 void pci_fe_progress(struct pci_fe *fe)
 {
+    uint64_t now_ns = 0;
+
     if (fe != NULL) {
         struct timespec now;
-        uint64_t now_ns;
 
-        if (fe->state == PCI_FE_STARTED &&
-            clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
             now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
+        if (fe->state == PCI_FE_STARTED && now_ns != 0) {
             if (fe->heartbeat_last_ns == 0)
                 fe->heartbeat_last_ns = now_ns;
             while (now_ns - fe->heartbeat_last_ns >= UINT64_C(500000000)) {
@@ -1139,6 +1167,8 @@ void pci_fe_progress(struct pci_fe *fe)
     if (fe != NULL && fe->pe != NULL)
         while (doca_pe_progress(fe->pe) != 0) {
         }
+    if (fe != NULL && fe->channel_recovery_needed && now_ns != 0)
+        recover_tlp_channel(fe, now_ns);
 }
 
 int pci_fe_plug(struct pci_fe *fe)

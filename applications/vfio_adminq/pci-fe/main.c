@@ -5,7 +5,6 @@
 #include "../common/vfio_adminq_abi.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
@@ -36,7 +35,7 @@ static void usage(const char *prog)
     printf("Usage:\n"
            "  %s serve [--pci-addr <addr>] [--gemini-socket <path>] "
            "--netdev-mac <xx:xx:xx:xx:xx:xx> "
-           "[--control-socket <path>]\n"
+           "[--control-socket <path>] [--num-msix <count>]\n"
            "  %s plug|unplug|status [--control-socket <path>]\n",
            prog, prog);
 }
@@ -121,10 +120,12 @@ static void control_server_progress(int listen_fd, struct pci_fe *fe)
                  pci_fe_state_name(fe->state));
     } else if (strcmp(command, "status") == 0) {
         snprintf(reply, sizeof(reply),
-                 "OK state=%s gemini=%s vhca_id=%u bdf=0x%04x ready=%u started=%u\n",
+                 "OK state=%s gemini=%s vhca_id=%u bdf=0x%04x ready=%u "
+                 "started=%u msix=%u recoveries=%u\n",
                  pci_fe_state_name(fe->state),
                  gemini_server_ready(fe->gemini) ? "connected" : "disconnected",
-                 fe->vhca_id, fe->bdf, fe->ready, fe->init_done);
+                 fe->vhca_id, fe->bdf, fe->ready, fe->init_done,
+                 fe->exposed_msix, fe->channel_recovery_attempts);
     } else {
         snprintf(reply, sizeof(reply), "ERROR rc=%d unknown-command\n", -EINVAL);
     }
@@ -185,8 +186,25 @@ static int parse_mac(const char *text, uint8_t mac[6])
     return 0;
 }
 
+static int parse_msix_count(const char *text, uint16_t *count)
+{
+    char *end = NULL;
+    unsigned long value;
+
+    if (text == NULL)
+        return -EINVAL;
+    errno = 0;
+    value = strtoul(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0' || value == 0 ||
+        value > VFIO_ADMINQ_NUM_MSIX)
+        return -EINVAL;
+    *count = (uint16_t)value;
+    return 0;
+}
+
 static int serve(const char *pci_addr, const char *gemini_path,
-                 const char *control_path, const uint8_t mac[6])
+                 const char *control_path, uint16_t exposed_msix,
+                 const uint8_t mac[6])
 {
     struct gemini_server gemini;
     struct pci_fe fe;
@@ -205,7 +223,7 @@ static int serve(const char *pci_addr, const char *gemini_path,
         fprintf(stderr, "failed to create Gemini server: %s\n", strerror(-rc));
         return 1;
     }
-    result = pci_fe_init(&fe, pci_addr, &gemini, mac);
+    result = pci_fe_init(&fe, pci_addr, &gemini, exposed_msix, mac);
     if (result != DOCA_SUCCESS) {
         fprintf(stderr, "failed to initialize pci-fe: %s\n",
                 doca_error_get_descr(result));
@@ -221,15 +239,16 @@ static int serve(const char *pci_addr, const char *gemini_path,
         return 1;
     }
 
-    printf("vfio-adminq pci-fe serving: pci=%s gemini=%s control=%s\n",
-           pci_addr, gemini_path, control_path);
+    printf("vfio-adminq pci-fe serving: pci=%s gemini=%s control=%s "
+           "msix=%u\n",
+           pci_addr, gemini_path, control_path, exposed_msix);
     while (!stop_requested) {
         struct pollfd pfd = {.fd = control_fd, .events = POLLIN};
 
         gemini_server_progress(&gemini);
         pci_fe_progress(&fe);
         pci_fe_process_pending(&fe);
-        if (poll(&pfd, 1, 10) > 0 && (pfd.revents & POLLIN) != 0)
+        if (poll(&pfd, 1, 1) > 0 && (pfd.revents & POLLIN) != 0)
             control_server_progress(control_fd, &fe);
     }
 
@@ -247,6 +266,7 @@ int main(int argc, char **argv)
         {"gemini-socket", required_argument, NULL, 'g'},
         {"control-socket", required_argument, NULL, 'c'},
         {"netdev-mac", required_argument, NULL, 'm'},
+        {"num-msix", required_argument, NULL, 'n'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -254,6 +274,7 @@ int main(int argc, char **argv)
     const char *gemini_path = SRDMA_GEMINI_DEFAULT_SOCKET;
     const char *control_path = DEFAULT_CONTROL_SOCKET;
     const char *mac_text = NULL;
+    uint16_t exposed_msix = VFIO_ADMINQ_DEFAULT_EXPOSED_MSIX;
     uint8_t mac[6];
     const char *command;
     int opt;
@@ -264,7 +285,7 @@ int main(int argc, char **argv)
     }
     command = argv[1];
     optind = 2;
-    while ((opt = getopt_long(argc, argv, "p:g:c:m:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:c:m:n:h", options, NULL)) != -1) {
         switch (opt) {
         case 'p':
             pci_addr = optarg;
@@ -277,6 +298,12 @@ int main(int argc, char **argv)
             break;
         case 'm':
             mac_text = optarg;
+            break;
+        case 'n':
+            if (parse_msix_count(optarg, &exposed_msix) != 0) {
+                fprintf(stderr, "invalid --num-msix: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'h':
             usage(argv[0]);
@@ -307,5 +334,5 @@ int main(int argc, char **argv)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
-    return serve(pci_addr, gemini_path, control_path, mac);
+    return serve(pci_addr, gemini_path, control_path, exposed_msix, mac);
 }

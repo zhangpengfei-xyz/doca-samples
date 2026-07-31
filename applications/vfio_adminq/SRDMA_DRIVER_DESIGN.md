@@ -9,7 +9,7 @@ Gemini。旧的 UAR TLP ring IPC 已移除；MSI-X 配置使用 io-engine 风格
 
 当前实现覆盖：
 
-- PCI `1e93:006a` endpoint、单 BAR0、128 个 MSI-X vector。
+- PCI `1e93:006a` endpoint、单 BAR0、最多 128 个 MSI-X vector；默认全部暴露。
 - AdminQ/AEQ DMA 初始化和控制面命令。
 - UCTX、PD、MR、EQ、CQ、QP、GID、统计和健康检查。
 - AdminQ、AEQ、CEQ、CQ、SQ、RQ 六类 doorbell 的 DPA completion。
@@ -114,6 +114,15 @@ DMA 写到 `msix_addr`。写 MSI-X 前必须先完成 RX entry body 和 owner/he
 PBA 仍作为 Host 可见 PCI ABI 的只读软件区域保留并在复位时清零，但不再用作
 `dev-be` 到 `pci-fe` 的通知通道。`pci-fe` 不启用 ACG，也不代发 MSI-X Memory Write。
 
+MSI-X capability 的 table size 和 `SRDMA_BFA_PCI_MAX_VECTORS` 都来自启动参数
+`--num-msix`，范围为 `1..128`。backing table 始终保留 128 entries，因此切换向量数
+不改变共享 ABI 或 BAR 布局。
+
+Host 的 `pci_alloc_irq_vectors()` 会形成 MSI-X mask/message table 的突发 TLP。TLP
+callback 不进行同步日志 I/O，并立即完成 request；主 PE loop 最大 poll 间隔为 1 ms。
+fatal callback 只设置恢复标志，channel 的 stop/destroy/recreate 在 callback 返回后
+执行，避免在 DOCA 回调上下文中重入生命周期操作。
+
 `pci-fe` 启动时创建 12 KiB memfd。共享内存及 `GEMINI_SCAN` payload 使用 io-engine ABI：
 
 | SCAN 字段 | 当前值 | 含义 |
@@ -133,6 +142,10 @@ address/data 以及 per-vector mask、MSI-X Enable/Function Mask 汇总到 confi
 后端必须先完成 CQE body 和 owner/header DMA，再读取稳定的 `msix_vec0` 快照并发送
 MSI-X DMA。若 address 为 0、未对齐，或 vector/function 被 mask/disable，本次通知
 返回错误且不提交 DMA。
+
+每次 DOCA DMA 都受 `--dma-timeout-ms` 约束，默认 5000 ms。超时任务的 user data 和
+buffer reference 使用 detached 生命周期，待 completion/error callback 回收；DMA
+context 在 buffer inventory 和 mmap 之前停止并销毁，避免超时清理时出现悬空回调。
 
 ## 7. 生命周期顺序
 
